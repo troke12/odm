@@ -207,18 +207,20 @@ only.
    file name, cookies and validators.
 2. **Plan.** The file is split into up to N chunks of at least 64 KiB. A tiny
    last chunk is merged into the one before it.
-3. **Transfer.** N workers each take a chunk and write it into the `.odmpart`
-   file at its absolute offset. Each range request asks for the raw bytes.
-   With more than one connection the requests use HTTP/1.1, so each
-   connection has its own socket.
-   A worker that finishes early takes half of the chunk with the most time
-   left, when that chunk will take at least twice as long as the fastest one;
-   until a pace is known, that is the largest remaining chunk. A connection that receives no bytes for 30 seconds is closed and
-   that chunk is retried from the last byte written;
-   one still waiting for response headers gets 5 minutes, as a server may
-   build the file before it answers. The other connections keep going. If the server
-   answers a smaller range with the whole file, bytes already stored are kept
-   and the remainder is fetched on one connection.
+3. **Transfer.** Workers write each chunk into the `.odmpart` file at its
+   absolute offset. The first connection opens immediately. Another opens
+   after every connection already running has stored file bytes, up to the
+   configured limit. Each range request asks for the raw bytes. With more
+   than one connection the requests use HTTP/1.1, so each connection has its
+   own socket. A worker that finishes early takes half of the chunk with the
+   most time left, when that chunk will take at least twice as long as the
+   fastest one; until a pace is known, that is the largest remaining chunk.
+   A connection that receives no bytes for 30 seconds is closed and that
+   chunk is retried from the last byte written; one still waiting for
+   response headers gets 5 minutes, as a server may build the file before
+   it answers. The other connections keep going. If the server answers a
+   smaller range with the whole file, bytes already stored are kept and the
+   remainder is fetched on one connection.
 4. **Finish.** The `.odmpart` file is renamed to the final name.
 
 Each chunk's progress (`{id,start,end,done}`) is saved as JSON, together with

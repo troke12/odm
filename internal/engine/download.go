@@ -123,6 +123,15 @@ type Download struct {
 	// plan changes when that answer is noticed. A read still holding the
 	// previous plan does not write those bytes into the replacement chunk.
 	plan int
+
+	// connLimit is how many connections this run may open. connOpened is how
+	// many workers have been started. connReady is how many of those have
+	// stored file bytes. The next worker starts only once every worker
+	// already opened has stored bytes.
+	connLimit  int
+	connOpened int
+	connReady  int
+	connWg     *sync.WaitGroup
 }
 
 // New creates a queued download. Probing happens on the first Start.
@@ -293,13 +302,18 @@ func (d *Download) Start(parent context.Context) {
 			workers = 1
 		}
 		var wg sync.WaitGroup
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() { defer wg.Done(); d.worker(transferCtx) }()
-		}
+		d.mu.Lock()
+		d.connLimit = workers
+		d.connOpened = 1
+		d.connReady = 0
+		d.connWg = &wg
+		d.mu.Unlock()
+		wg.Add(1)
+		go func() { defer wg.Done(); d.worker(transferCtx) }()
 		wg.Wait()
 		transferCancel()
 		d.mu.Lock()
+		d.connWg = nil
 		d.transferCancel = nil
 		paused := ctx.Err() != nil
 		complete := d.allCompleteLocked()
@@ -586,6 +600,7 @@ func (d *Download) openTarget(fresh bool) error {
 }
 
 func (d *Download) worker(ctx context.Context) {
+	ready := false
 	for {
 		if ctx.Err() != nil {
 			return
@@ -597,7 +612,7 @@ func (d *Download) worker(ctx context.Context) {
 		if ch == nil {
 			return
 		}
-		err := d.fetchWithRetry(ctx, ch)
+		err := d.fetchWithRetry(ctx, ch, &ready)
 		if errors.Is(err, errRepresentationChanged) {
 			d.noteChanged()
 			d.mu.Lock()
@@ -651,14 +666,14 @@ func (d *Download) trySplit() *Chunk {
 	return nc
 }
 
-func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
+func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk, ready *bool) error {
 	var err error
 	backoff := d.retryDelay()
 	for attempt := 0; attempt < MaxRetries; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err = d.fetch(ctx, ch)
+		err = d.fetch(ctx, ch, ready)
 		if err == nil || errors.Is(err, errIgnoredRange) {
 			return err
 		}
@@ -683,7 +698,7 @@ func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 	return err
 }
 
-func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
+func (d *Download) fetch(ctx context.Context, ch *Chunk, ready *bool) error {
 	d.mu.Lock()
 	if ch.Complete() {
 		d.mu.Unlock()
@@ -813,6 +828,10 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 				ch.notePace(int64(n), time.Now())
 				d.mu.Unlock()
 				d.notify(false)
+				if ready != nil && !*ready {
+					*ready = true
+					d.noteReady(ctx)
+				}
 				if werr := d.limiter.Wait(ctx, n); werr != nil {
 					return werr
 				}
@@ -843,6 +862,26 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 	}
 	return nil
+}
+
+// noteReady records that one open connection has stored file bytes. When
+// every connection already opened has done that, one more connection starts,
+// up to the configured limit.
+func (d *Download) noteReady(ctx context.Context) {
+	d.mu.Lock()
+	d.connReady++
+	if d.connWg == nil || d.Status == StatusError || d.connOpened >= d.connLimit || d.connReady < d.connOpened {
+		d.mu.Unlock()
+		return
+	}
+	d.connOpened++
+	wg := d.connWg
+	d.mu.Unlock()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.worker(ctx)
+	}()
 }
 
 // errStalled means a connection produced no bytes within the idle limit
