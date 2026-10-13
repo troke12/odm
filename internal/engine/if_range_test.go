@@ -167,6 +167,142 @@ func TestIfRangeFailureRestartsMidTransfer(t *testing.T) {
 	}
 }
 
+func TestWholeFileOK(t *testing.T) {
+	header := make(http.Header)
+	header.Set("ETag", `"a"`)
+	resp := &http.Response{Header: header, ContentLength: 100}
+	if !wholeFileOK(0, 99, 100, `"a"`, "", resp) {
+		t.Fatal("matching etag on a full-file 200 was rejected")
+	}
+	if wholeFileOK(10, 99, 100, `"a"`, "", resp) {
+		t.Fatal("a 200 for a subrange was accepted")
+	}
+	header.Set("ETag", `"b"`)
+	if wholeFileOK(0, 99, 100, `"a"`, "", resp) {
+		t.Fatal("a different etag was accepted")
+	}
+	header.Set("ETag", `"a"`)
+	resp.ContentLength = 90
+	if wholeFileOK(0, 99, 100, `"a"`, "", resp) {
+		t.Fatal("a different length was accepted")
+	}
+	resp.ContentLength = -1
+	if !wholeFileOK(0, 99, 100, `"a"`, "", resp) {
+		t.Fatal("unknown length with a matching etag was rejected")
+	}
+	header.Del("ETag")
+	header.Set("Last-Modified", "Mon, 1 Jan 2024 00:00:00 GMT")
+	if !wholeFileOK(0, 99, 100, "", "Mon, 1 Jan 2024 00:00:00 GMT", resp) {
+		t.Fatal("matching modification time was rejected")
+	}
+	if wholeFileOK(0, 99, 100, "", "Tue, 2 Jan 2024 00:00:00 GMT", resp) {
+		t.Fatal("a different modification time was accepted")
+	}
+}
+
+func TestFullFileOKWithSameETagCompletes(t *testing.T) {
+	data := payload(128 * 1024)
+	const etag = `"same"`
+	full := fmt.Sprintf("bytes=0-%d", len(data)-1)
+	var fullOK atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == full && r.Header.Get("If-Range") == etag {
+			fullOK.Add(1)
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+			return
+		}
+		writeRanged(w, r, data, etag, "")
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	d := New("full-ok", srv.URL+"/file.bin", dir, 1, nil, 0, srv.Client())
+	t.Cleanup(func() { closeDownloadFile(d) })
+	d.Start(context.Background())
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if n := fullOK.Load(); n != 1 {
+		t.Fatalf("full-file 200 responses = %d, want 1", n)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match the source")
+	}
+}
+
+func TestSubrangeOKWithSameETagDoesNotWrite(t *testing.T) {
+	data := payload(128 * 1024)
+	const etag = `"same"`
+	const half = 64 * 1024
+	remainder := fmt.Sprintf("bytes=%d-", half)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.Header.Get("Range"), remainder) && r.Header.Get("If-Range") == etag {
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+			return
+		}
+		writeRanged(w, r, data, etag, "")
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	partial := make([]byte, len(data))
+	copy(partial, data[:half])
+	if err := os.WriteFile(filepath.Join(dir, "part.bin.odmpart"), partial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := State{
+		ID: "part", URL: srv.URL + "/part.bin", FinalURL: srv.URL + "/part.bin",
+		FileName: "part.bin", Dir: dir, Connections: 1, Total: int64(len(data)), RangeOK: true,
+		ETag: etag, Status: StatusPaused,
+		Chunks: []*Chunk{
+			{ID: 0, Start: 0, End: int64(len(data)) - 1, Done: half},
+		},
+	}
+	d := Restore(st, srv.Client())
+	t.Cleanup(func() { closeDownloadFile(d) })
+	d.Start(context.Background())
+
+	info := d.Info()
+	if info.Status != StatusError {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if info.Error != errRepresentationChanged.Error() {
+		t.Fatalf("error=%q", info.Error)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "part.bin")); !os.IsNotExist(err) {
+		t.Fatal("partial file was renamed after a subrange 200")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "part.bin.odmpart"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got[:half], data[:half]) {
+		t.Fatal("bytes already stored were overwritten")
+	}
+}
+
+func closeDownloadFile(d *Download) {
+	d.mu.Lock()
+	if d.file != nil {
+		_ = d.file.Close()
+		d.file = nil
+	}
+	d.mu.Unlock()
+}
+
 func writeRanged(w http.ResponseWriter, r *http.Request, data []byte, etag, modified string) {
 	w.Header().Set("Accept-Ranges", "bytes")
 	if etag != "" {

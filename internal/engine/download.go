@@ -612,11 +612,13 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	finalURL := d.FinalURL
 	headers := d.Headers
 	cookies := d.cookies
-	validator := d.ETag
-	if validator == "" {
-		validator = d.LastModified
-	}
+	etag, modified := d.ETag, d.LastModified
+	total := d.Total
 	d.mu.Unlock()
+	validator := etag
+	if validator == "" {
+		validator = modified
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
 	if err != nil {
@@ -654,14 +656,16 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 
 	if rangeOK {
 		// If-Range failed: the server is sending the whole new representation.
-		// Do not write those bytes into the old range.
+		// Do not write those bytes into the old range. A 200 for a range that
+		// already covers the whole file is the same representation when the
+		// validator still matches, so that body is kept.
 		if resp.StatusCode == http.StatusOK && validator != "" {
-			return errRepresentationChanged
-		}
-		if resp.StatusCode != http.StatusPartialContent {
+			if !wholeFileOK(start, end, total, etag, modified, resp) {
+				return errRepresentationChanged
+			}
+		} else if resp.StatusCode != http.StatusPartialContent {
 			return fmt.Errorf("server ignored Range (status %s)", resp.Status)
-		}
-		if cs, _, _, ok := ParseContentRange(resp.Header.Get("Content-Range")); ok && cs != start {
+		} else if cs, _, _, ok := ParseContentRange(resp.Header.Get("Content-Range")); ok && cs != start {
 			return fmt.Errorf("range mismatch: asked %d, got %d", start, cs)
 		}
 	} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
@@ -846,6 +850,31 @@ func (d *Download) retryDelay() time.Duration {
 // errRepresentationChanged means the server no longer serves the bytes this
 // download has partly stored. The partial file is discarded and fetched again.
 var errRepresentationChanged = errors.New("file on the server changed")
+
+// wholeFileOK reports whether a 200 response is the file this request already
+// asked for in full. Some servers answer 200, not 206, when the range covers
+// every byte and the validator still matches.
+func wholeFileOK(start, end, total int64, etag, modified string, resp *http.Response) bool {
+	if total <= 0 || start != 0 || end != total-1 {
+		return false
+	}
+	switch {
+	case etag != "":
+		if resp.Header.Get("ETag") != etag {
+			return false
+		}
+	case modified != "":
+		if resp.Header.Get("Last-Modified") != modified {
+			return false
+		}
+	default:
+		return false
+	}
+	if n := resp.ContentLength; n >= 0 && n != total {
+		return false
+	}
+	return true
+}
 
 func (d *Download) noteChanged() {
 	d.mu.Lock()
