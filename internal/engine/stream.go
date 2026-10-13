@@ -272,12 +272,10 @@ func (d *Download) decorate(req *http.Request) {
 	}
 }
 
-// guardedClient is the client for every request of a download, stream or
-// file: the download's own, kept off the local network when the address it
-// was given (a stream's manifest, else its URL) is public (see localGuard).
-func (d *Download) guardedClient() *http.Client {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+// guardManifestLocked is the address the local-network guard judges a
+// download by: the address it was given (a stream's manifest, else its
+// URL, or where it was trusted from). The caller holds d.mu.
+func (d *Download) guardManifestLocked() string {
 	manifest := d.URL
 	if d.TrustFrom != "" {
 		manifest = d.TrustFrom
@@ -285,6 +283,16 @@ func (d *Download) guardedClient() *http.Client {
 	if d.Stream != nil && d.Stream.Manifest != "" {
 		manifest = d.Stream.Manifest
 	}
+	return manifest
+}
+
+// guardedClient is the client for every request of a download, stream or
+// file: the download's own, kept off the local network when the address it
+// was given (a stream's manifest, else its URL) is public (see localGuard).
+func (d *Download) guardedClient() *http.Client {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	manifest := d.guardManifestLocked()
 	if d.guarded == nil || d.guardedFrom != d.client || d.guardedFor != manifest {
 		if d.guarded != nil {
 			d.guarded.CloseIdleConnections() // its pool is its own

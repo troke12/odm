@@ -11,7 +11,8 @@ queues. It runs as a desktop app, or headless with a JSON API.
 
 **Downloading**
 - Up to 32 connections per file using `Range` requests (8 by default), with
-  per-server overrides.
+  per-server overrides. Several connections use HTTP/1.1, one socket each.
+  A single stream can still use HTTP/2.
 - An idle connection takes over half of the busiest remaining chunk, so all
   connections stay busy until the end.
 - Resume after a pause, crash or restart from the exact byte offset. If a
@@ -207,6 +208,8 @@ only.
    last chunk is merged into the one before it.
 3. **Transfer.** N workers each take a chunk and write it into the `.odmpart`
    file at its absolute offset. Each range request asks for the raw bytes.
+   With more than one connection the requests use HTTP/1.1, so each
+   connection has its own socket.
    A worker that finishes early takes over half of the largest remaining
    chunk. A connection that receives no bytes for 30 seconds is closed and
    that chunk is retried from the last byte written;

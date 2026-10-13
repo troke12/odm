@@ -26,6 +26,11 @@ All notable changes to ODM are documented here. The format is based on
   that one-byte request returns 206; a file it serves as one chunk (one
   connection, or too small to split) takes that 200 as the whole file.
 
+### Changed
+
+- A download that uses several connections fetches each part over HTTP/1.1,
+  so each connection has its own socket. A single stream can still use HTTP/2.
+
 ## [0.4.3] - 2026-10-19
 
 ### Added

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -118,6 +119,23 @@ func buildClient(s Settings) *http.Client {
 		transport.Proxy = SystemProxy
 	}
 	return &http.Client{Transport: transport}
+}
+
+// segmentTransport is a copy of base that speaks only HTTP/1.1.
+// Several range requests on one HTTP/2 connection share a single socket, so
+// a segmented download uses one HTTP/1.1 socket per connection instead.
+// A nil base starts from an empty transport.
+func segmentTransport(base *http.Transport) *http.Transport {
+	var t *http.Transport
+	if base == nil {
+		t = &http.Transport{}
+	} else {
+		t = base.Clone()
+	}
+	t.ForceAttemptHTTP2 = false
+	// A non-nil empty map turns off automatic HTTP/2.
+	t.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
+	return t
 }
 
 // HTTPClient returns the client downloads use, so other requests (such as

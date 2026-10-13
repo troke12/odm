@@ -49,7 +49,13 @@ type Download struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 
-	client  *http.Client
+	client *http.Client
+	// h1 serves several ranges at once over HTTP/1.1. The shared client may
+	// use HTTP/2, which would put every range on one socket. It is guarded
+	// like guarded, and rebuilt on the same changes (h1From, h1For).
+	h1      *http.Client
+	h1From  *http.Client
+	h1For   string
 	limiter *Limiter
 	shared  *Limiter
 	cancel  context.CancelCauseFunc
@@ -679,6 +685,10 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	}
 	start, end := ch.Next(), ch.End
 	rangeOK := d.RangeOK
+	conns := d.Connections
+	if d.alone {
+		conns = 1 // one connection after an ignored range: no need for HTTP/1.1
+	}
 	finalURL := d.FinalURL
 	headers := d.Headers
 	cookies := d.cookies
@@ -688,6 +698,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	plan := d.plan
 	d.mu.Unlock()
 	validator, isETag := ifRangeValidator(etag, modified)
+	client := d.segmentClient(rangeOK, conns)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
 	if err != nil {
@@ -717,7 +728,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		req.Header.Set("Cookie", cookieHeader(cookies))
 	}
 
-	resp, err := d.exchange(ctx, req)
+	resp, err := d.exchange(ctx, client, req)
 	if err != nil {
 		return err
 	}
@@ -837,10 +848,10 @@ var errStalled = errors.New("connection stalled")
 // cut short. It is longer than the stall limit: some servers build the file
 // (an archive, an export) before they answer at all. Pausing cancels ctx
 // and is reported as ctx.Err().
-func (d *Download) exchange(ctx context.Context, req *http.Request) (*http.Response, error) {
+func (d *Download) exchange(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
 	headerCtx, cancel := context.WithCancel(ctx)
 	timer := time.AfterFunc(d.headerWait(), cancel)
-	resp, err := d.guardedClient().Do(req.WithContext(headerCtx))
+	resp, err := client.Do(req.WithContext(headerCtx))
 	if timer.Stop() {
 		if err != nil {
 			cancel()
@@ -1089,6 +1100,48 @@ func (d *Download) noteChanged() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// segmentClient returns the HTTP/1.1 client when more than one ranged
+// connection will run. One stream keeps the shared client. Both go through
+// the local-network guard, like every request of a download.
+func (d *Download) segmentClient(rangeOK bool, conns int) *http.Client {
+	if !rangeOK || conns <= 1 {
+		return d.guardedClient()
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	manifest := d.guardManifestLocked()
+	if d.h1 != nil && d.h1From == d.client && d.h1For == manifest {
+		return d.h1
+	}
+	src := d.client
+	if src == nil {
+		src = http.DefaultClient
+	}
+	var base *http.Transport
+	if src.Transport != nil {
+		tr, ok := src.Transport.(*http.Transport)
+		if !ok {
+			// Not a transport this can copy: the shared client, guarded.
+			if d.guarded == nil || d.guardedFrom != d.client || d.guardedFor != manifest {
+				d.guarded, d.guardedFrom, d.guardedFor = guardLocal(d.client, manifest), d.client, manifest
+			}
+			return d.guarded
+		}
+		base = tr
+	}
+	if d.h1 != nil {
+		d.h1.CloseIdleConnections() // its pool is its own
+	}
+	h1 := &http.Client{
+		Transport:     segmentTransport(base),
+		CheckRedirect: src.CheckRedirect,
+		Jar:           src.Jar,
+		Timeout:       src.Timeout,
+	}
+	d.h1, d.h1From, d.h1For = guardLocal(h1, manifest), d.client, manifest
+	return d.h1
 }
 
 func (d *Download) finish() error {
