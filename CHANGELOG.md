@@ -6,6 +6,13 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+
+### Added
+
+- Resumed downloads send the saved `ETag` or `Last-Modified` as `If-Range`.
+  When the file on the server has changed, the partial file is discarded and
+  the download starts again from the first byte.
+
 ## [0.4.3] - 2026-10-19
 
 ### Added

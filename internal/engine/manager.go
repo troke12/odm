@@ -808,6 +808,7 @@ func (m *Manager) Readdress(ctx context.Context, id, newURL string) error {
 	d.mu.Lock()
 	d.URL, d.FinalURL, d.cookies = newURL, p.FinalURL, p.Cookies
 	d.TrustFrom = "" // the user gave this address
+	d.ETag, d.LastModified = p.ETag, p.LastModified
 	if d.Status == StatusError {
 		d.Status, d.Err = StatusPaused, ""
 	}

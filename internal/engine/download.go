@@ -96,6 +96,15 @@ type Download struct {
 	// DefaultHeaderTimeout when set. Tests use short values; a zero value
 	// means the default.
 	stallTimeout, headerTimeout time.Duration
+	// ETag and LastModified identify the representation on the server.
+	// A resume sends one of them as If-Range and starts over when it no
+	// longer matches.
+	ETag         string
+	LastModified string
+
+	discardPart    bool
+	changed        bool
+	transferCancel context.CancelFunc
 }
 
 // New creates a queued download. Probing happens on the first Start.
@@ -222,58 +231,89 @@ func (d *Download) Start(parent context.Context) {
 		return
 	}
 
-	if err := d.prepare(ctx); err != nil {
-		// A cancelled context means pause (or shutdown) during the probe, not
-		// a failure; same rule as the ctx.Err() check after the workers.
-		if ctx.Err() != nil {
+	// One extra pass covers a representation that changes after the probe:
+	// the first pass stops, the partial file is dropped, and the second
+	// pass fetches the new file. A further change is reported as an error.
+	for pass := 0; pass < 2; pass++ {
+		if err := d.prepare(ctx); err != nil {
+			// A cancelled context means pause (or shutdown) during the probe, not
+			// a failure; same rule as the ctx.Err() check after the workers.
+			if ctx.Err() != nil {
+				d.mu.Lock()
+				d.Status = StatusPaused
+				d.mu.Unlock()
+			} else {
+				d.fail(err)
+			}
+			d.notify(true)
+			return
+		}
+
+		transferCtx, transferCancel := context.WithCancel(ctx)
+		d.mu.Lock()
+		d.transferCancel = transferCancel
+		d.mu.Unlock()
+
+		workers := d.Connections
+		d.mu.Lock()
+		if !d.RangeOK {
+			workers = 1
+		}
+		d.mu.Unlock()
+		if workers < 1 {
+			workers = 1
+		}
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); d.worker(transferCtx) }()
+		}
+		wg.Wait()
+		transferCancel()
+		d.mu.Lock()
+		d.transferCancel = nil
+		paused := ctx.Err() != nil
+		complete := d.allCompleteLocked()
+		status := d.Status
+		changed := d.changed
+		d.changed = false
+		d.mu.Unlock()
+
+		if paused {
 			d.mu.Lock()
 			d.Status = StatusPaused
 			d.mu.Unlock()
-		} else {
-			d.fail(err)
+			d.notify(true)
+			return
+		}
+		if changed {
+			if pass == 1 {
+				d.fail(errRepresentationChanged)
+				d.notify(true)
+				return
+			}
+			d.mu.Lock()
+			d.Status = StatusDownloading
+			d.Err = ""
+			d.mu.Unlock()
+			continue
+		}
+
+		switch {
+		case complete:
+			if err := d.finish(); err != nil {
+				d.fail(err)
+			} else {
+				d.mu.Lock()
+				d.Status = StatusComplete
+				d.mu.Unlock()
+			}
+		case status != StatusError:
+			d.fail(errors.New("transfer ended with unfinished chunks"))
 		}
 		d.notify(true)
 		return
 	}
-
-	workers := d.Connections
-	if !d.RangeOK {
-		workers = 1
-	}
-	if workers < 1 {
-		workers = 1
-	}
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); d.worker(ctx) }()
-	}
-	wg.Wait()
-
-	d.mu.Lock()
-	paused := ctx.Err() != nil
-	complete := d.allCompleteLocked()
-	status := d.Status
-	d.mu.Unlock()
-
-	switch {
-	case complete:
-		if err := d.finish(); err != nil {
-			d.fail(err)
-		} else {
-			d.mu.Lock()
-			d.Status = StatusComplete
-			d.mu.Unlock()
-		}
-	case paused:
-		d.mu.Lock()
-		d.Status = StatusPaused
-		d.mu.Unlock()
-	case status != StatusError:
-		d.fail(errors.New("transfer ended with unfinished chunks"))
-	}
-	d.notify(true)
 }
 
 func (d *Download) prepare(ctx context.Context) error {
@@ -287,28 +327,104 @@ func (d *Download) prepare(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		d.mu.Lock()
-		d.FinalURL = p.FinalURL
-		if d.FileName == "" {
-			d.FileName = p.FileName
-		}
-		d.Total = p.Total
-		d.RangeOK = p.RangeOK
-		if d.Connections <= 0 {
-			d.Connections = DefaultConnections
-		}
-		if d.SpeedLimit != 0 && d.limiter == nil {
-			d.limiter = NewLimiter(d.SpeedLimit)
-		}
-		d.cookies = p.Cookies
-		if p.RangeOK {
-			d.Chunks = NewPlan(p.Total, d.Connections)
-		} else {
-			d.Chunks = []*Chunk{{ID: 0, Start: 0, End: p.Total - 1}}
-		}
-		d.mu.Unlock()
+		d.applyProbe(p)
+	} else if err := d.revalidate(ctx); err != nil {
+		return err
 	}
 	return d.openTarget(needProbe)
+}
+
+// applyProbe stores a first probe and builds the chunk plan. The caller
+// does not hold d.mu.
+func (d *Download) applyProbe(p *Probe) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.FinalURL = p.FinalURL
+	if d.FileName == "" {
+		d.FileName = p.FileName
+	}
+	d.Total = p.Total
+	d.RangeOK = p.RangeOK
+	d.ETag = p.ETag
+	d.LastModified = p.LastModified
+	d.cookies = p.Cookies
+	if d.Connections <= 0 {
+		d.Connections = DefaultConnections
+	}
+	if d.SpeedLimit != 0 && d.limiter == nil {
+		d.limiter = NewLimiter(d.SpeedLimit)
+	}
+	d.planLocked(p)
+}
+
+// revalidate runs before a resume. When the saved ETag, Last-Modified or
+// size no longer matches, the partial file is discarded and planned again.
+func (d *Download) revalidate(ctx context.Context) error {
+	d.mu.Lock()
+	rawURL, headers := d.URL, d.Headers
+	etag, modified, total, ranged := d.ETag, d.LastModified, d.Total, d.RangeOK
+	done := d.doneLocked()
+	d.mu.Unlock()
+
+	p, err := Inspect(ctx, d.client, rawURL, headers)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.cookies = p.Cookies
+	if p.FinalURL != "" {
+		d.FinalURL = p.FinalURL
+	}
+	if !representationDiffers(etag, modified, total, ranged, done, p) {
+		if p.ETag != "" {
+			d.ETag = p.ETag
+		}
+		if p.LastModified != "" {
+			d.LastModified = p.LastModified
+		}
+		return nil
+	}
+	d.ETag = p.ETag
+	d.LastModified = p.LastModified
+	d.Total = p.Total
+	d.RangeOK = p.RangeOK
+	d.planLocked(p)
+	d.discardPart = true
+	return nil
+}
+
+// planLocked replaces the chunk list from a probe. The caller holds d.mu.
+func (d *Download) planLocked(p *Probe) {
+	conns := d.Connections
+	if conns < 1 {
+		conns = 1
+	}
+	if p.RangeOK {
+		d.Chunks = NewPlan(p.Total, conns)
+		return
+	}
+	d.Chunks = []*Chunk{{ID: 0, Start: 0, End: p.Total - 1}}
+}
+
+// representationDiffers reports whether p is a different file from the one
+// already partly stored. A missing saved validator does not count, so state
+// written before validators were kept still resumes. A different size, or a
+// ranged download whose server no longer accepts ranges, does.
+func representationDiffers(etag, modified string, total int64, ranged bool, done int64, p *Probe) bool {
+	if total > 0 && p.Total > 0 && total != p.Total {
+		return true
+	}
+	if etag != "" && p.ETag != "" && etag != p.ETag {
+		return true
+	}
+	if modified != "" && p.LastModified != "" && modified != p.LastModified {
+		return true
+	}
+	if ranged && !p.RangeOK && done > 0 {
+		return true
+	}
+	return false
 }
 
 // openTarget opens the .odmpart file. A fresh download (first probe) claims
@@ -320,6 +436,9 @@ func (d *Download) openTarget(fresh bool) error {
 	if d.FileName == "" {
 		d.FileName = "download.bin"
 	}
+	discard := d.discardPart
+	d.discardPart = false
+	existing := d.file
 	dir := d.BaseDir
 	if dir == "" {
 		dir = d.Dir
@@ -343,6 +462,18 @@ func (d *Download) openTarget(fresh bool) error {
 	rangeOK, total := d.RangeOK && d.Stream == nil, d.Total
 	d.mu.Unlock()
 
+	if existing != nil && !fresh {
+		if discard {
+			if err := existing.Truncate(0); err != nil {
+				return err
+			}
+		}
+		if rangeOK && total > 0 {
+			return existing.Truncate(total)
+		}
+		return nil
+	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -360,6 +491,12 @@ func (d *Download) openTarget(fresh bool) error {
 	} else {
 		f, err = os.OpenFile(tmp, os.O_CREATE|os.O_RDWR, 0o644)
 		if err != nil {
+			return err
+		}
+	}
+	if discard {
+		if err := f.Truncate(0); err != nil {
+			_ = f.Close()
 			return err
 		}
 	}
@@ -388,6 +525,13 @@ func (d *Download) worker(ctx context.Context) {
 			return
 		}
 		err := d.fetchWithRetry(ctx, ch)
+		if errors.Is(err, errRepresentationChanged) {
+			d.noteChanged()
+			d.mu.Lock()
+			ch.claimed = false
+			d.mu.Unlock()
+			return
+		}
 		d.mu.Lock()
 		ch.claimed = false
 		if err != nil {
@@ -436,6 +580,9 @@ func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, errRepresentationChanged) {
+			return err
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -465,6 +612,10 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	finalURL := d.FinalURL
 	headers := d.Headers
 	cookies := d.cookies
+	validator := d.ETag
+	if validator == "" {
+		validator = d.LastModified
+	}
 	d.mu.Unlock()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
@@ -479,6 +630,9 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		// an Accept-Encoding set on the download, which would ask for the
 		// very compressed bytes that cannot be written here.
 		req.Header.Set("Accept-Encoding", "identity")
+		if validator != "" {
+			req.Header.Set("If-Range", validator)
+		}
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 	}
 	if d.auth != nil {
@@ -499,6 +653,11 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	defer resp.Body.Close()
 
 	if rangeOK {
+		// If-Range failed: the server is sending the whole new representation.
+		// Do not write those bytes into the old range.
+		if resp.StatusCode == http.StatusOK && validator != "" {
+			return errRepresentationChanged
+		}
 		if resp.StatusCode != http.StatusPartialContent {
 			return fmt.Errorf("server ignored Range (status %s)", resp.Status)
 		}
@@ -682,6 +841,20 @@ func (d *Download) retryDelay() time.Duration {
 		return d.retryBase
 	}
 	return 300 * time.Millisecond
+}
+
+// errRepresentationChanged means the server no longer serves the bytes this
+// download has partly stored. The partial file is discarded and fetched again.
+var errRepresentationChanged = errors.New("file on the server changed")
+
+func (d *Download) noteChanged() {
+	d.mu.Lock()
+	d.changed = true
+	cancel := d.transferCancel
+	d.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (d *Download) finish() error {
@@ -871,6 +1044,8 @@ type State struct {
 	OpenWhenDone bool              `json:"open_when_done,omitempty"`
 	Total        int64             `json:"total"`
 	RangeOK      bool              `json:"range_ok"`
+	ETag         string            `json:"etag,omitempty"`
+	LastModified string            `json:"last_modified,omitempty"`
 	CategoryName string            `json:"category_name,omitempty"`
 	Queue        string            `json:"queue,omitempty"`
 	Description  string            `json:"description,omitempty"`
@@ -910,7 +1085,8 @@ func (d *Download) State() State {
 		BaseDir: d.BaseDir, Headers: d.Headers, Connections: d.Connections, SpeedLimit: d.SpeedLimit,
 		OpenWhenDone: d.OpenWhenDone, CategoryName: d.CategoryName,
 		Queue: d.Queue, Description: d.Description, Order: d.Order,
-		Total: d.Total, RangeOK: d.RangeOK, Status: status, Err: d.Err,
+		Total: d.Total, RangeOK: d.RangeOK, ETag: d.ETag, LastModified: d.LastModified,
+		Status: status, Err: d.Err,
 		Chunks: chunks, Stream: stream, TrustFrom: d.TrustFrom, CreatedAt: d.CreatedAt, UpdatedAt: time.Now(),
 	}
 }
@@ -930,6 +1106,8 @@ func Restore(s State, client *http.Client) *Download {
 	d.Dir = s.Dir
 	d.Total = s.Total
 	d.RangeOK = s.RangeOK
+	d.ETag = s.ETag
+	d.LastModified = s.LastModified
 	d.OpenWhenDone = s.OpenWhenDone
 	d.CategoryName = s.CategoryName
 	d.Queue = s.Queue
