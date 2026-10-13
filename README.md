@@ -17,6 +17,10 @@ queues. It runs as a desktop app, or headless with a JSON API.
 - Resume after a pause, crash or restart from the exact byte offset. If a
   link expires, give the download a new address and it continues where it
   stopped, as long as the new address serves the same file.
+- A saved `ETag` or `Last-Modified` is sent as `If-Range` on resume. If the
+  file on the server has changed, the partial download is discarded and
+  started again from the first byte. A `200` for a range that already covers
+  the whole file is kept when that validator still matches.
 - Servers that do not support ranges are fetched on a single stream.
 - Global and per-download speed limits, plus an optional data cap per time
   window.
@@ -188,8 +192,12 @@ only.
    of the largest remaining chunk.
 4. **Finish.** The `.odmpart` file is renamed to the final name.
 
-Each chunk's progress (`{id,start,end,done}`) is saved as JSON, so a restart
-continues from the exact byte. Segmented ranges, byte-offset resume and chunk
+Each chunk's progress (`{id,start,end,done}`) is saved as JSON, together with
+the `ETag` and `Last-Modified` from the probe, so a restart continues from
+the exact byte while the file on the server is unchanged. If `If-Range` fails,
+or a later probe reports a different validator or size, ODM deletes the partial
+file and downloads the new one. A `200` for a range that already covers the
+whole file is kept when the validator still matches. Segmented ranges, byte-offset resume and chunk
 splitting are standard download-manager techniques. ODM implements them in
 its own code.
 
