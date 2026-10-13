@@ -14,6 +14,12 @@ All notable changes to ODM are documented here. The format is based on
   download starts again from the first byte. A `200` response whose range
   already covers the whole file is kept when that validator still matches.
 
+### Fixed
+
+- A server that answers a smaller range with the whole file no longer fails
+  that chunk. Bytes already stored are kept, and the rest of the file is
+  fetched on one connection.
+
 ## [0.4.3] - 2026-10-19
 
 ### Added

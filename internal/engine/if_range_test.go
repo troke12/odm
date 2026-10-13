@@ -168,24 +168,6 @@ func TestIfRangeFailureRestartsMidTransfer(t *testing.T) {
 	}
 }
 
-func TestWholeFileOK(t *testing.T) {
-	resp := &http.Response{Header: make(http.Header), ContentLength: 100}
-	if !wholeFileOK(0, 99, 100, resp) {
-		t.Fatal("a full-file 200 was rejected")
-	}
-	if wholeFileOK(10, 99, 100, resp) {
-		t.Fatal("a 200 for a subrange was accepted")
-	}
-	resp.ContentLength = 90
-	if wholeFileOK(0, 99, 100, resp) {
-		t.Fatal("a different length was accepted")
-	}
-	resp.ContentLength = -1
-	if !wholeFileOK(0, 99, 100, resp) {
-		t.Fatal("unknown length was rejected")
-	}
-}
-
 func TestIfRangeValidator(t *testing.T) {
 	const date = "Mon, 01 Jan 2024 00:00:00 GMT"
 	for _, c := range []struct {

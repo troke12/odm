@@ -211,7 +211,9 @@ only.
    chunk. A connection that receives no bytes for 30 seconds is closed and
    that chunk is retried from the last byte written;
    one still waiting for response headers gets 5 minutes, as a server may
-   build the file before it answers. The other connections keep going.
+   build the file before it answers. The other connections keep going. If the server
+   answers a smaller range with the whole file, bytes already stored are kept
+   and the remainder is fetched on one connection.
 4. **Finish.** The `.odmpart` file is renamed to the final name.
 
 Each chunk's progress (`{id,start,end,done}`) is saved as JSON, together with
