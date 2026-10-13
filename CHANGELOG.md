@@ -6,6 +6,13 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- When two connections receive different bytes for the same offset, the
+  download continues on one connection from the last matching byte. If that
+  copy still differs, the partial file is discarded and the download starts
+  again from the first byte.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added

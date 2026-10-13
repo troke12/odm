@@ -17,6 +17,10 @@ queues. It runs as a desktop app, or headless with a JSON API.
 - Resume after a pause, crash or restart from the exact byte offset. If a
   link expires, give the download a new address and it continues where it
   stopped, as long as the new address serves the same file.
+- A later chunk re-reads a short stretch of the chunk before it. If the two
+  copies differ, the rest of the file is fetched on one connection. If that
+  copy still differs, the partial file is discarded and the download starts
+  again from the first byte.
 - Servers that do not support ranges are fetched on a single stream.
 - Global and per-download speed limits, plus an optional data cap per time
   window.
@@ -189,9 +193,14 @@ only.
 4. **Finish.** The `.odmpart` file is renamed to the final name.
 
 Each chunk's progress (`{id,start,end,done}`) is saved as JSON, so a restart
-continues from the exact byte. Segmented ranges, byte-offset resume and chunk
-splitting are standard download-manager techniques. ODM implements them in
-its own code.
+continues from the exact byte. A chunk that starts after another one also
+reads 64 bytes of that earlier chunk and compares the two copies. When they
+differ, the other connections stop and one connection finishes from the last
+matching byte. If that copy differs as well, the partial file is deleted and
+downloaded again from the first byte, still on one connection. A resume after
+this fallback stays on one connection. Segmented ranges, byte-offset resume
+and chunk splitting are standard download-manager techniques. ODM implements
+them in its own code.
 
 ## Project layout
 

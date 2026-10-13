@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,36 @@ import (
 	"sync"
 	"time"
 )
+
+// boundaryOverlap is how many bytes a later chunk re-reads from the chunk
+// before it. The two copies are compared, so a connection that returns
+// different bytes for the same offset is caught. 64 is long enough to be a
+// real sample and far smaller than the minimum chunk.
+const boundaryOverlap = 64
+
+// errConflict means two reads of the same bytes did not match.
+var errConflict = errors.New("connections returned different bytes")
+
+// errConflictGaveUp is errConflict after the partial file was discarded
+// and fetched again from the first byte.
+var errConflictGaveUp = errors.New("downloaded data did not match; restarted from the first byte and it still did not match")
+
+// conflictError is errConflict plus the file offset of the first byte that
+// differed. Bytes before that offset are kept.
+type conflictError struct {
+	at int64
+}
+
+func (e *conflictError) Error() string { return errConflict.Error() }
+
+func (e *conflictError) Unwrap() error { return errConflict }
+
+// witness is a copy of bytes one connection read for a region another
+// connection owns. It is compared when those bytes are written.
+type witness struct {
+	off  int64
+	data []byte
+}
 
 // Download is a single managed download job.
 type Download struct {
@@ -61,6 +92,18 @@ type Download struct {
 	lastAt   time.Time
 	speed    int64
 	notifyAt time.Time
+
+	// single is set once two connections disagreed. Later passes, and a
+	// resume, stay on one connection.
+	single bool
+	// restarted is set when that single connection disagreed too and the
+	// partial file was discarded. One Start does this only once.
+	restarted bool
+
+	conflicted     bool
+	conflictAt     int64
+	witnesses      []witness
+	transferCancel context.CancelFunc
 }
 
 // New creates a queued download. Probing happens on the first Start.
@@ -157,6 +200,11 @@ func (d *Download) Start(parent context.Context) {
 	d.Err = ""
 	d.lastDone = 0
 	d.lastAt = time.Now()
+	// Each Start may discard the partial file once. single stays set so a
+	// resume does not go back to parallel connections.
+	d.restarted = false
+	d.conflicted = false
+	d.witnesses = nil
 	d.mu.Unlock()
 	d.notify(true)
 
@@ -174,43 +222,90 @@ func (d *Download) Start(parent context.Context) {
 		return
 	}
 
-	workers := d.Connections
-	if !d.RangeOK {
-		workers = 1
-	}
-	if workers < 1 {
-		workers = 1
-	}
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); d.worker(ctx) }()
-	}
-	wg.Wait()
-
-	d.mu.Lock()
-	paused := ctx.Err() != nil
-	complete := d.allCompleteLocked()
-	status := d.Status
-	d.mu.Unlock()
-
-	switch {
-	case complete:
-		if err := d.finish(); err != nil {
-			d.fail(err)
-		} else {
-			d.mu.Lock()
-			d.Status = StatusComplete
-			d.mu.Unlock()
-		}
-	case paused:
+	// Pass 0 uses every connection. A disagreement keeps the consistent
+	// prefix and retries on one connection. A second disagreement discards
+	// the partial file and fetches it once more from the first byte.
+	for pass := 0; pass < 3; pass++ {
+		transferCtx, transferCancel := context.WithCancel(ctx)
 		d.mu.Lock()
-		d.Status = StatusPaused
+		d.transferCancel = transferCancel
+		d.witnesses = nil
+		d.conflicted = false
+		workers := d.Connections
+		if !d.RangeOK || d.single {
+			workers = 1
+		}
 		d.mu.Unlock()
-	case status != StatusError:
-		d.fail(errors.New("transfer ended with unfinished chunks"))
+		if workers < 1 {
+			workers = 1
+		}
+
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); d.worker(transferCtx) }()
+		}
+		wg.Wait()
+		transferCancel()
+
+		d.mu.Lock()
+		d.transferCancel = nil
+		paused := ctx.Err() != nil
+		complete := d.allCompleteLocked()
+		status := d.Status
+		conflicted := d.conflicted
+		at := d.conflictAt
+		single := d.single
+		restarted := d.restarted
+		d.conflicted = false
+		d.mu.Unlock()
+
+		if paused {
+			// A disagreement noticed as the user pauses still sticks: the
+			// resume keeps the matching prefix and uses one connection.
+			if conflicted && !single {
+				d.adoptSingle(at)
+			}
+			d.mu.Lock()
+			d.Status = StatusPaused
+			d.mu.Unlock()
+			d.notify(true)
+			return
+		}
+		if conflicted {
+			if single && restarted {
+				d.fail(errConflictGaveUp)
+				d.notify(true)
+				return
+			}
+			if single {
+				if err := d.restartFromZero(); err != nil {
+					d.fail(err)
+					d.notify(true)
+					return
+				}
+				continue
+			}
+			d.adoptSingle(at)
+			continue
+		}
+
+		switch {
+		case complete:
+			if err := d.finish(); err != nil {
+				d.fail(err)
+			} else {
+				d.mu.Lock()
+				d.Status = StatusComplete
+				d.mu.Unlock()
+			}
+		case status != StatusError:
+			d.fail(errors.New("transfer ended with unfinished chunks"))
+		}
+		d.notify(true)
+		return
 	}
+	d.fail(errConflictGaveUp)
 	d.notify(true)
 }
 
@@ -326,14 +421,25 @@ func (d *Download) worker(ctx context.Context) {
 		err := d.fetchWithRetry(ctx, ch)
 		d.mu.Lock()
 		ch.claimed = false
-		if err != nil {
-			d.Err = err.Error()
-			d.Status = StatusError
-		}
 		d.mu.Unlock()
-		if err != nil {
+		if err == nil {
+			continue
+		}
+		var conflict *conflictError
+		if errors.As(err, &conflict) {
+			d.noteConflict(conflict.at)
 			return
 		}
+		// Pause cancels the parent context. A disagreement cancels only this
+		// pass. Neither one is a failed download.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			return
+		}
+		d.mu.Lock()
+		d.Err = err.Error()
+		d.Status = StatusError
+		d.mu.Unlock()
+		return
 	}
 }
 
@@ -372,6 +478,9 @@ func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, errConflict) {
+			return err
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -398,6 +507,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	finalURL := d.FinalURL
 	headers := d.Headers
 	cookies := d.cookies
+	reqStart, overlap := d.overlapLocked(ch, start, end, rangeOK)
 	d.mu.Unlock()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
@@ -406,7 +516,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	}
 	applyHeaders(req, headers)
 	if rangeOK {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", reqStart, end))
 	}
 	if d.auth != nil {
 		if u, perr := url.Parse(finalURL); perr == nil {
@@ -429,11 +539,24 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		if resp.StatusCode != http.StatusPartialContent {
 			return fmt.Errorf("server ignored Range (status %s)", resp.Status)
 		}
-		if cs, _, _, ok := ParseContentRange(resp.Header.Get("Content-Range")); ok && cs != start {
-			return fmt.Errorf("range mismatch: asked %d, got %d", start, cs)
+		if cs, _, _, ok := ParseContentRange(resp.Header.Get("Content-Range")); ok && cs != reqStart {
+			return fmt.Errorf("range mismatch: asked %d, got %d", reqStart, cs)
 		}
 	} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	if overlap > 0 {
+		sample := make([]byte, overlap)
+		if _, err := io.ReadFull(resp.Body, sample); err != nil {
+			return err
+		}
+		// These bytes belong to the previous chunk. Compare them, or hold
+		// them until that chunk writes the same offset. Do not store them
+		// again from this connection.
+		if err := d.checkOverlap(reqStart, sample); err != nil {
+			return err
+		}
 	}
 
 	buf := make([]byte, 64*1024)
@@ -444,25 +567,14 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			var werr error
+			pos, werr = d.writeSpan(ctx, ch, pos, buf[:n])
+			if werr != nil {
+				return werr
+			}
 			d.mu.Lock()
 			limit := ch.End
 			d.mu.Unlock()
-			if limit >= 0 && pos+int64(n) > limit+1 {
-				n = int(limit + 1 - pos)
-			}
-			if n > 0 {
-				if _, werr := d.file.WriteAt(buf[:n], pos); werr != nil {
-					return werr
-				}
-				pos += int64(n)
-				d.mu.Lock()
-				ch.Done += int64(n)
-				d.mu.Unlock()
-				d.notify(false)
-				if werr := d.limiter.Wait(ctx, n); werr != nil {
-					return werr
-				}
-			}
 			if limit >= 0 && pos > limit {
 				break
 			}
@@ -475,6 +587,294 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 	}
 	return nil
+}
+
+// overlapLocked decides whether this request should re-read the bytes just
+// before start. The caller holds d.mu. A chunk's first request always does.
+// A resumed request does only when those bytes are already stored, which is
+// how a fallback re-checks the prefix it kept.
+func (d *Download) overlapLocked(ch *Chunk, start, end int64, rangeOK bool) (reqStart int64, overlap int) {
+	reqStart = start
+	if !rangeOK || start <= 0 || end < start {
+		return reqStart, 0
+	}
+	win := int64(boundaryOverlap)
+	if win > start {
+		win = start
+	}
+	if start != ch.Start && d.writtenPrefixLocked(start-win, start) != start {
+		return reqStart, 0
+	}
+	return start - win, int(win)
+}
+
+// checkOverlap compares sample with bytes already stored at off. The part
+// not stored yet is remembered and compared when the owning chunk writes it.
+func (d *Download) checkOverlap(off int64, sample []byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	end := off + int64(len(sample))
+	if have := d.writtenPrefixLocked(off, end); have > off {
+		n := int(have - off)
+		got := make([]byte, n)
+		rn, err := d.file.ReadAt(got, off)
+		if rn != n || (err != nil && !errors.Is(err, io.EOF)) {
+			if err != nil {
+				return err
+			}
+			return &conflictError{at: off}
+		}
+		if !bytes.Equal(got, sample[:n]) {
+			return &conflictError{at: differAt(off, got, sample[:n])}
+		}
+		if have >= end {
+			return nil
+		}
+		sample = sample[n:]
+		off = have
+	}
+	if len(sample) > 0 {
+		d.addWitnessLocked(off, sample)
+	}
+	return nil
+}
+
+// writeSpan writes buf at pos, stopping at the chunk's end. A copy another
+// connection already read for this offset is compared before and after the
+// write, because that copy can arrive while the write is in flight.
+func (d *Download) writeSpan(ctx context.Context, ch *Chunk, pos int64, buf []byte) (int64, error) {
+	d.mu.Lock()
+	limit := ch.End
+	n := len(buf)
+	if limit >= 0 && pos+int64(n) > limit+1 {
+		n = int(limit + 1 - pos)
+	}
+	if n <= 0 {
+		d.mu.Unlock()
+		return pos, nil
+	}
+	buf = buf[:n]
+	if at, bad := d.mismatchLocked(pos, buf); bad {
+		d.mu.Unlock()
+		return pos, &conflictError{at: at}
+	}
+	d.mu.Unlock()
+
+	if _, err := d.file.WriteAt(buf, pos); err != nil {
+		return pos, err
+	}
+
+	d.mu.Lock()
+	if at, bad := d.mismatchLocked(pos, buf); bad {
+		d.mu.Unlock()
+		// The conflicting bytes were not counted, so the next pass writes
+		// this span again.
+		return pos, &conflictError{at: at}
+	}
+	d.consumeWitnessLocked(pos, buf)
+	ch.Done += int64(n)
+	d.mu.Unlock()
+	d.notify(false)
+	if err := d.limiter.Wait(ctx, n); err != nil {
+		return pos + int64(n), err
+	}
+	return pos + int64(n), nil
+}
+
+// noteConflict records the earliest offset that disagreed and stops the
+// other connections of this pass. The caller does not hold d.mu.
+func (d *Download) noteConflict(at int64) {
+	d.mu.Lock()
+	if !d.conflicted || at < d.conflictAt {
+		d.conflictAt = at
+		d.conflicted = true
+	}
+	cancel := d.transferCancel
+	d.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// adoptSingle keeps bytes before at and continues the download on one connection.
+func (d *Download) adoptSingle(at int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.single = true
+	d.witnesses = nil
+	d.rewindLocked(at)
+	d.Status = StatusDownloading
+	d.Err = ""
+}
+
+// restartFromZero drops the partial file and plans the same chunks again.
+// The following pass still uses one connection.
+func (d *Download) restartFromZero() error {
+	d.mu.Lock()
+	total := d.Total
+	rangeOK := d.RangeOK
+	conns := d.Connections
+	f := d.file
+	d.mu.Unlock()
+
+	if f != nil {
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if rangeOK && total > 0 {
+			if err := f.Truncate(total); err != nil {
+				return err
+			}
+		}
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.restarted = true
+	d.single = true
+	d.witnesses = nil
+	if rangeOK {
+		d.Chunks = NewPlan(total, conns)
+	} else if total > 0 {
+		d.Chunks = []*Chunk{{ID: 0, Start: 0, End: total - 1}}
+	} else {
+		d.Chunks = []*Chunk{{ID: 0, Start: 0, End: -1}}
+	}
+	d.Status = StatusDownloading
+	d.Err = ""
+	return nil
+}
+
+// rewindLocked forgets progress at and after at. The caller holds d.mu.
+func (d *Download) rewindLocked(at int64) {
+	if at < 0 {
+		at = 0
+	}
+	d.witnesses = nil
+	for _, c := range d.Chunks {
+		c.claimed = false
+		if c.End >= 0 && c.End < at {
+			continue
+		}
+		if c.Start >= at {
+			c.Done = 0
+			continue
+		}
+		if c.Start+c.Done > at {
+			c.Done = at - c.Start
+		}
+	}
+}
+
+// writtenPrefixLocked returns the end of the contiguous stored run that
+// starts at from, capped at to. The caller holds d.mu.
+func (d *Download) writtenPrefixLocked(from, to int64) int64 {
+	off := from
+	for off < to {
+		owner := d.chunkAtLocked(off)
+		if owner == nil {
+			break
+		}
+		have := owner.Start + owner.Done
+		if owner.End >= 0 && have > owner.End+1 {
+			have = owner.End + 1
+		}
+		if off >= have {
+			break
+		}
+		if have >= to {
+			return to
+		}
+		off = have
+	}
+	return off
+}
+
+func (d *Download) chunkAtLocked(off int64) *Chunk {
+	for _, c := range d.Chunks {
+		if c.End < 0 {
+			if off >= c.Start {
+				return c
+			}
+			continue
+		}
+		if off >= c.Start && off <= c.End {
+			return c
+		}
+	}
+	return nil
+}
+
+func (d *Download) addWitnessLocked(off int64, sample []byte) {
+	end := off + int64(len(sample))
+	kept := d.witnesses[:0]
+	for _, w := range d.witnesses {
+		wEnd := w.off + int64(len(w.data))
+		if wEnd <= off || w.off >= end {
+			kept = append(kept, w)
+		}
+	}
+	d.witnesses = append(kept, witness{off: off, data: append([]byte(nil), sample...)})
+}
+
+// mismatchLocked reports the absolute offset of the first byte of buf that
+// differs from a witness. The caller holds d.mu.
+func (d *Download) mismatchLocked(pos int64, buf []byte) (int64, bool) {
+	end := pos + int64(len(buf))
+	for _, w := range d.witnesses {
+		wEnd := w.off + int64(len(w.data))
+		if wEnd <= pos || w.off >= end {
+			continue
+		}
+		from := pos
+		if w.off > from {
+			from = w.off
+		}
+		to := end
+		if wEnd < to {
+			to = wEnd
+		}
+		for i := from; i < to; i++ {
+			if buf[i-pos] != w.data[i-w.off] {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// consumeWitnessLocked drops the parts of every witness that buf just stored.
+// The caller holds d.mu.
+func (d *Download) consumeWitnessLocked(pos int64, buf []byte) {
+	end := pos + int64(len(buf))
+	kept := d.witnesses[:0]
+	for _, w := range d.witnesses {
+		wEnd := w.off + int64(len(w.data))
+		if wEnd <= pos || w.off >= end {
+			kept = append(kept, w)
+			continue
+		}
+		if w.off < pos {
+			kept = append(kept, witness{off: w.off, data: append([]byte(nil), w.data[:pos-w.off]...)})
+		}
+		if wEnd > end {
+			kept = append(kept, witness{off: end, data: append([]byte(nil), w.data[end-w.off:]...)})
+		}
+	}
+	d.witnesses = kept
+}
+
+func differAt(off int64, got, want []byte) int64 {
+	n := len(got)
+	if len(want) < n {
+		n = len(want)
+	}
+	for i := 0; i < n; i++ {
+		if got[i] != want[i] {
+			return off + int64(i)
+		}
+	}
+	return off
 }
 
 func (d *Download) finish() error {
@@ -608,6 +1008,7 @@ type State struct {
 	OpenWhenDone bool              `json:"open_when_done,omitempty"`
 	Total        int64             `json:"total"`
 	RangeOK      bool              `json:"range_ok"`
+	Single       bool              `json:"single,omitempty"`
 	CategoryName string            `json:"category_name,omitempty"`
 	Queue        string            `json:"queue,omitempty"`
 	Description  string            `json:"description,omitempty"`
@@ -638,7 +1039,7 @@ func (d *Download) State() State {
 		BaseDir: d.BaseDir, Headers: d.Headers, Connections: d.Connections, SpeedLimit: d.SpeedLimit,
 		OpenWhenDone: d.OpenWhenDone, CategoryName: d.CategoryName,
 		Queue: d.Queue, Description: d.Description, Order: d.Order,
-		Total: d.Total, RangeOK: d.RangeOK, Status: status, Err: d.Err,
+		Total: d.Total, RangeOK: d.RangeOK, Single: d.single, Status: status, Err: d.Err,
 		Chunks: chunks, CreatedAt: d.CreatedAt, UpdatedAt: time.Now(),
 	}
 }
@@ -658,6 +1059,7 @@ func Restore(s State, client *http.Client) *Download {
 	d.Dir = s.Dir
 	d.Total = s.Total
 	d.RangeOK = s.RangeOK
+	d.single = s.Single
 	d.OpenWhenDone = s.OpenWhenDone
 	d.CategoryName = s.CategoryName
 	d.Queue = s.Queue
