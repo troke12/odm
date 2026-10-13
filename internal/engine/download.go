@@ -464,6 +464,12 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	}
 	applyHeaders(req, headers)
 	if rangeOK {
+		// The transport would otherwise ask for gzip. A compressed body is
+		// not the file's own bytes and must not be written at this offset.
+		// A value the download already set is kept.
+		if req.Header.Get("Accept-Encoding") == "" {
+			req.Header.Set("Accept-Encoding", "identity")
+		}
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 	}
 	if d.auth != nil {

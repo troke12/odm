@@ -13,6 +13,9 @@ All notable changes to ODM are documented here. The format is based on
   `conhost.exe` processes behind (#14). A failed settings fetch is now
   retried after 30 seconds, requests arriving together share one fetch,
   and a page past its peek budget no longer asks at all.
+- Range requests send `Accept-Encoding: identity`, so the bytes written to
+  disk are the file itself. An `Accept-Encoding` header set on the download
+  is left as it is.
 
 ## [0.4.2] - 2026-10-16
 
