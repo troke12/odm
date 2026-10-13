@@ -31,12 +31,16 @@ func NewPlan(total int64, conns int) []*Chunk {
 	return chunks
 }
 
-// Split carves the tail half off the largest incomplete chunk and returns it
-// as a new chunk for a freed connection.
+// Split carves the tail half off one incomplete chunk and returns it as a
+// new chunk for a freed connection. The chunk that will take the longest to
+// finish is chosen when two paces are known and the slower one will take at
+// least twice as long. Otherwise the largest remainder is chosen.
 // It reports false when no chunk is big enough to split safely.
 func Split(chunks []*Chunk, minChunk int64) (*Chunk, bool) {
-	var victim *Chunk
-	var best int64
+	var largest, slow *Chunk
+	var bestRemain int64
+	var slowETA, fastETA float64
+	paced := 0
 	maxID := -1
 	for _, c := range chunks {
 		if c.ID > maxID {
@@ -45,9 +49,28 @@ func Split(chunks []*Chunk, minChunk int64) (*Chunk, bool) {
 		if c.Complete() {
 			continue
 		}
-		if r := c.Remaining(); r >= 2*minChunk && r > best {
-			best, victim = r, c
+		r := c.Remaining()
+		if r < 2*minChunk {
+			continue
 		}
+		if r > bestRemain {
+			bestRemain, largest = r, c
+		}
+		if c.pace <= 0 {
+			continue
+		}
+		eta := float64(r) / float64(c.pace)
+		paced++
+		if slow == nil || eta > slowETA {
+			slow, slowETA = c, eta
+		}
+		if paced == 1 || eta < fastETA {
+			fastETA = eta
+		}
+	}
+	victim := largest
+	if paced >= 2 && slow != nil && fastETA > 0 && slowETA >= 2*fastETA {
+		victim = slow
 	}
 	if victim == nil {
 		return nil, false

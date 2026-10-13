@@ -13,8 +13,9 @@ queues. It runs as a desktop app, or headless with a JSON API.
 - Up to 32 connections per file using `Range` requests (8 by default), with
   per-server overrides. Several connections use HTTP/1.1, one socket each.
   A single stream can still use HTTP/2.
-- An idle connection takes over half of the busiest remaining chunk, so all
-  connections stay busy until the end.
+- An idle connection takes half of the chunk that will take the longest to
+  finish, when that chunk will take at least twice as long as the fastest
+  one. Until a pace is known, it takes half of the largest remaining chunk.
 - Resume after a pause, crash or restart from the exact byte offset. If a
   link expires, give the download a new address and it continues where it
   stopped, as long as the new address serves the same file.
@@ -210,8 +211,9 @@ only.
    file at its absolute offset. Each range request asks for the raw bytes.
    With more than one connection the requests use HTTP/1.1, so each
    connection has its own socket.
-   A worker that finishes early takes over half of the largest remaining
-   chunk. A connection that receives no bytes for 30 seconds is closed and
+   A worker that finishes early takes half of the chunk with the most time
+   left, when that chunk will take at least twice as long as the fastest one;
+   until a pace is known, that is the largest remaining chunk. A connection that receives no bytes for 30 seconds is closed and
    that chunk is retried from the last byte written;
    one still waiting for response headers gets 5 minutes, as a server may
    build the file before it answers. The other connections keep going. If the server

@@ -809,6 +809,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 				pos += int64(n)
 				d.mu.Lock()
 				ch.Done += int64(n)
+				ch.notePace(int64(n), time.Now())
 				d.mu.Unlock()
 				d.notify(false)
 				if werr := d.limiter.Wait(ctx, n); werr != nil {
