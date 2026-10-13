@@ -194,6 +194,116 @@ func TestStalledConnectionRetriesFromLastByte(t *testing.T) {
 	}
 }
 
+func TestHeaderStallRetries(t *testing.T) {
+	data := bytes.Repeat([]byte("h"), 128*1024)
+	var transfers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, explicit := testRange(r, len(data))
+		if start < 0 || end < start {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if explicit && transfers.Add(1) == 1 {
+			<-r.Context().Done()
+			return
+		}
+		writeTestRange(w, data, start, end)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	d := New("header-stall", srv.URL+"/h.bin", dir, 1, nil, 0, srv.Client())
+	d.stallTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q transfers=%d", info.Status, info.Error, transfers.Load())
+	}
+	if transfers.Load() < 2 {
+		t.Fatalf("header stall was not retried, transfers=%d", transfers.Load())
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("bytes after a header stall do not match")
+	}
+}
+
+func TestPauseDuringHeaderWaitIsPaused(t *testing.T) {
+	data := bytes.Repeat([]byte("p"), 128*1024)
+	var d *Download
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, explicit := testRange(r, len(data))
+		if start < 0 || end < start {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if explicit {
+			d.Pause()
+			<-release
+			return
+		}
+		writeTestRange(w, data, start, end)
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	dir := t.TempDir()
+	d = New("header-pause", srv.URL+"/p.bin", dir, 1, nil, 0, srv.Client())
+	d.stallTimeout = time.Second
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusPaused {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+}
+
+func testRange(r *http.Request, total int) (start, end int, explicit bool) {
+	spec := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+	parts := strings.SplitN(spec, "-", 2)
+	start, _ = strconv.Atoi(parts[0])
+	end = total - 1
+	explicit = len(parts) == 2 && parts[1] != ""
+	if explicit {
+		if v, err := strconv.Atoi(parts[1]); err == nil {
+			end = v
+		}
+	}
+	if end >= total {
+		end = total - 1
+	}
+	return start, end, explicit
+}
+
+func writeTestRange(w http.ResponseWriter, data []byte, start, end int) {
+	body := data[start : end+1]
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = w.Write(body)
+}
+
+func closeEngineFile(d *Download) {
+	d.mu.Lock()
+	if d.file != nil {
+		_ = d.file.Close()
+		d.file = nil
+	}
+	d.mu.Unlock()
+}
+
 func TestDownloadWithoutRangeSupport(t *testing.T) {
 	data := []byte(strings.Repeat("ochi-download-manager!", 4096))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

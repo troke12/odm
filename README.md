@@ -201,8 +201,9 @@ only.
    file at its absolute offset. Each range request asks for the raw bytes.
    A worker that finishes early takes over half
    of the largest remaining chunk. A connection that receives no bytes for 30
-   seconds is closed and that chunk is retried from the last byte written.
-   The other connections keep going.
+   seconds, including while it waits for response headers, is closed and that
+   chunk is retried from the last byte written. The other connections keep
+   going.
 4. **Finish.** The `.odmpart` file is renamed to the final name.
 
 Each chunk's progress (`{id,start,end,done}`) is saved as JSON, so a restart

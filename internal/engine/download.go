@@ -487,7 +487,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		req.Header.Set("Cookie", cookieHeader(cookies))
 	}
 
-	resp, err := d.guardedClient().Do(req)
+	resp, err := d.exchange(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -545,10 +545,51 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	return nil
 }
 
-// errStalled means the response body produced no bytes within the idle limit.
-// The chunk is retried from the last byte written. A pause is not a stall:
-// the caller returns the context error before counting a retry.
+// errStalled means a connection produced no bytes within the idle limit,
+// while waiting for response headers or while reading the body. The chunk
+// is retried from the last byte written. A pause is not a stall: the caller
+// returns the context error before counting a retry.
 var errStalled = errors.New("connection stalled")
+
+// exchange sends req and returns when the response headers arrive. The stall
+// limit bounds that wait, then it is stopped so a long body is not cut short.
+// Pausing cancels ctx and is reported as ctx.Err().
+func (d *Download) exchange(ctx context.Context, req *http.Request) (*http.Response, error) {
+	headerCtx, cancel := context.WithCancel(ctx)
+	timer := time.AfterFunc(d.readStall(), cancel)
+	resp, err := d.guardedClient().Do(req.WithContext(headerCtx))
+	if timer.Stop() {
+		if err != nil {
+			cancel()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+		return resp, nil
+	}
+	cancel()
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, errStalled
+}
+
+// cancelOnClose releases the header context once the body is finished.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
 
 func (d *Download) readStall() time.Duration {
 	d.mu.Lock()

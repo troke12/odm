@@ -21,9 +21,10 @@ const (
 	DefaultFileLimit   = 3
 	DefaultChunkStep   = 1 << 21
 	MaxRetries         = 8
-	// DefaultStallTimeout is how long one connection may receive no bytes
-	// before that connection is closed and its chunk is retried. The other
-	// connections of the same file keep transferring.
+	// DefaultStallTimeout is how long one connection may go without a byte,
+	// including the wait for response headers, before that connection is
+	// closed and its chunk is retried. The other connections of the same
+	// file keep transferring.
 	DefaultStallTimeout = 30 * time.Second
 	DefaultUserAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ODM/0.1"
 )

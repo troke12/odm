@@ -9,8 +9,8 @@ All notable changes to ODM are documented here. The format is based on
 ### Added
 
 - A connection that receives no bytes for 30 seconds is closed and its chunk
-  is retried from the last written offset. Other connections of the same file
-  keep going.
+  is retried from the last written offset. The same limit covers the wait
+  for response headers. Other connections of the same file keep going.
 
 ### Fixed
 
