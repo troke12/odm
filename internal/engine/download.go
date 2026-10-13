@@ -47,10 +47,22 @@ type Download struct {
 	limiter *Limiter
 	shared  *Limiter
 	cancel  context.CancelFunc
+	// transferCancel stops the connections of the current pass. It is separate
+	// from cancel so one answered range can end the pass without pausing.
+	transferCancel context.CancelFunc
 	// pauseReq records a Pause that arrived while no transfer context exists
 	// yet (the manager has dispatched the download but Start has not run), so
 	// Start honours it instead of the pause being silently dropped.
 	pauseReq bool
+	// alone is set once a ranged request is answered with the whole file.
+	// Later passes and a resumed download use one connection.
+	alone bool
+	// sawIgnored is set for the pass that noticed that answer, so Start
+	// fetches the remainder after the other connections have stopped.
+	sawIgnored bool
+	// pass changes when that answer is noticed. A read still holding the
+	// previous plan does not write those bytes into the replacement chunk.
+	pass     int
 	file     *os.File
 	cookies  []*http.Cookie
 	auth     func(host string) (string, string, bool)
@@ -174,44 +186,84 @@ func (d *Download) Start(parent context.Context) {
 		return
 	}
 
-	workers := d.Connections
-	if !d.RangeOK {
-		workers = 1
-	}
-	if workers < 1 {
-		workers = 1
-	}
-
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); d.worker(ctx) }()
-	}
-	wg.Wait()
-
-	d.mu.Lock()
-	paused := ctx.Err() != nil
-	complete := d.allCompleteLocked()
-	status := d.Status
-	d.mu.Unlock()
-
-	switch {
-	case complete:
-		if err := d.finish(); err != nil {
-			d.fail(err)
-		} else {
-			d.mu.Lock()
-			d.Status = StatusComplete
-			d.mu.Unlock()
-		}
-	case paused:
+	// A 200 for a smaller range keeps the stored prefix and runs once more
+	// on one connection. The pass context cancels the other connections
+	// without pausing the download.
+	for {
+		transferCtx, transferCancel := context.WithCancel(ctx)
 		d.mu.Lock()
-		d.Status = StatusPaused
+		d.transferCancel = transferCancel
+		d.sawIgnored = false
+		workers := d.Connections
+		if !d.RangeOK || d.alone {
+			workers = 1
+		}
 		d.mu.Unlock()
-	case status != StatusError:
-		d.fail(errors.New("transfer ended with unfinished chunks"))
+		if workers < 1 {
+			workers = 1
+		}
+
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); d.worker(transferCtx) }()
+		}
+		wg.Wait()
+		transferCancel()
+
+		d.mu.Lock()
+		d.transferCancel = nil
+		paused := ctx.Err() != nil
+		complete := d.allCompleteLocked()
+		status := d.Status
+		again := d.sawIgnored
+		d.mu.Unlock()
+
+		if complete {
+			if err := d.finish(); err != nil {
+				d.fail(err)
+			} else {
+				d.mu.Lock()
+				d.Status = StatusComplete
+				d.mu.Unlock()
+			}
+			d.notify(true)
+			return
+		}
+		if paused {
+			if again {
+				d.planAlone()
+			}
+			d.mu.Lock()
+			d.Status = StatusPaused
+			d.mu.Unlock()
+			d.notify(true)
+			return
+		}
+		if again && status != StatusError {
+			d.planAlone()
+			d.mu.Lock()
+			complete = d.allCompleteLocked()
+			d.mu.Unlock()
+			if complete {
+				if err := d.finish(); err != nil {
+					d.fail(err)
+				} else {
+					d.mu.Lock()
+					d.Status = StatusComplete
+					d.mu.Unlock()
+				}
+				d.notify(true)
+				return
+			}
+			continue
+		}
+		if status != StatusError {
+			d.fail(errors.New("transfer ended with unfinished chunks"))
+		}
+		d.notify(true)
+		return
 	}
-	d.notify(true)
 }
 
 func (d *Download) prepare(ctx context.Context) error {
@@ -326,11 +378,17 @@ func (d *Download) worker(ctx context.Context) {
 		err := d.fetchWithRetry(ctx, ch)
 		d.mu.Lock()
 		ch.claimed = false
-		if err != nil {
+		ignored := errors.Is(err, errIgnoredRange)
+		// A cancelled pass, including a pause, is not a failed chunk.
+		if err != nil && !ignored && ctx.Err() == nil {
 			d.Err = err.Error()
 			d.Status = StatusError
 		}
 		d.mu.Unlock()
+		if ignored {
+			d.noteIgnoredRange()
+			return
+		}
 		if err != nil {
 			return
 		}
@@ -352,6 +410,9 @@ func (d *Download) takeChunk() *Chunk {
 func (d *Download) trySplit() *Chunk {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.alone {
+		return nil
+	}
 	nc, ok := Split(d.Chunks, MinChunkSize)
 	if !ok {
 		return nil
@@ -369,8 +430,8 @@ func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 			return ctx.Err()
 		}
 		err = d.fetch(ctx, ch)
-		if err == nil {
-			return nil
+		if err == nil || errors.Is(err, errIgnoredRange) {
+			return err
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -398,6 +459,9 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	finalURL := d.FinalURL
 	headers := d.Headers
 	cookies := d.cookies
+	total := d.Total
+	alone := d.alone
+	pass := d.pass
 	d.mu.Unlock()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
@@ -426,11 +490,28 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	defer resp.Body.Close()
 
 	if rangeOK {
-		if resp.StatusCode != http.StatusPartialContent {
+		switch resp.StatusCode {
+		case http.StatusPartialContent:
+			if cs, _, _, ok := ParseContentRange(resp.Header.Get("Content-Range")); ok && cs != start {
+				return fmt.Errorf("range mismatch: asked %d, got %d", start, cs)
+			}
+		case http.StatusOK:
+			// A 200 is the whole file. A shorter length is not that file.
+			if resp.ContentLength >= 0 && total > 0 && resp.ContentLength != total {
+				return fmt.Errorf("server ignored Range (status %s)", resp.Status)
+			}
+			if !wholeFileRange(start, end, total) {
+				if !alone {
+					return errIgnoredRange
+				}
+				// This connection is already the only one. Skip the prefix
+				// that is already stored and write the rest at its offset.
+				if err := discardPrefix(ctx, resp.Body, start); err != nil {
+					return err
+				}
+			}
+		default:
 			return fmt.Errorf("server ignored Range (status %s)", resp.Status)
-		}
-		if cs, _, _, ok := ParseContentRange(resp.Header.Get("Content-Range")); ok && cs != start {
-			return fmt.Errorf("range mismatch: asked %d, got %d", start, cs)
 		}
 	} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("unexpected status: %s", resp.Status)
@@ -445,6 +526,10 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			d.mu.Lock()
+			if d.pass != pass {
+				d.mu.Unlock()
+				return errIgnoredRange
+			}
 			limit := ch.End
 			d.mu.Unlock()
 			if limit >= 0 && pos+int64(n) > limit+1 {
@@ -475,6 +560,112 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 	}
 	return nil
+}
+
+// errIgnoredRange means the server answered a smaller range with the whole
+// file. The body is not written at the range offset. Finished bytes stay,
+// and the download continues on one connection.
+var errIgnoredRange = errors.New("server returned the whole file for a range")
+
+// wholeFileRange reports whether [start, end] already covers the whole file.
+// end < 0 is an open-ended range.
+func wholeFileRange(start, end, total int64) bool {
+	if start != 0 {
+		return false
+	}
+	if total <= 0 {
+		return end < 0
+	}
+	return end < 0 || end >= total-1
+}
+
+// discardPrefix reads n bytes and drops them. A 200 body starts at byte 0,
+// so the single connection skips the prefix already stored.
+func discardPrefix(ctx context.Context, body io.Reader, n int64) error {
+	buf := make([]byte, 64*1024)
+	var dropped int64
+	for dropped < n {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		want := n - dropped
+		if want > int64(len(buf)) {
+			want = int64(len(buf))
+		}
+		nr, err := body.Read(buf[:want])
+		dropped += int64(nr)
+		if err != nil {
+			if errors.Is(err, io.EOF) && dropped >= n {
+				return nil
+			}
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("whole-file response ended before byte %d", n)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// noteIgnoredRange records that a range was answered with the whole file
+// and stops the other connections of this pass. The plan is rebuilt after
+// they have stopped.
+func (d *Download) noteIgnoredRange() {
+	d.mu.Lock()
+	if d.alone {
+		d.mu.Unlock()
+		return
+	}
+	d.alone = true
+	d.sawIgnored = true
+	d.pass++
+	cancel := d.transferCancel
+	d.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// planAlone keeps the contiguous prefix and leaves one chunk for the rest.
+// Every connection has stopped, so chunk progress is stable.
+func (d *Download) planAlone() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.Total <= 0 {
+		return
+	}
+	gap := contiguousDone(d.Chunks, d.Total)
+	if gap > d.Total {
+		gap = d.Total
+	}
+	d.Chunks = []*Chunk{{ID: 0, Start: 0, End: d.Total - 1, Done: gap}}
+}
+
+// contiguousDone is the first offset, starting at 0, that no chunk has stored.
+func contiguousDone(chunks []*Chunk, total int64) int64 {
+	off := int64(0)
+	for {
+		if total > 0 && off >= total {
+			return total
+		}
+		next := off
+		for _, c := range chunks {
+			if c == nil || c.Start > off {
+				continue
+			}
+			have := c.Start + c.Done
+			if c.End >= 0 && have > c.End+1 {
+				have = c.End + 1
+			}
+			if have > next {
+				next = have
+			}
+		}
+		if next == off {
+			return off
+		}
+		off = next
+	}
 }
 
 func (d *Download) finish() error {
@@ -608,6 +799,7 @@ type State struct {
 	OpenWhenDone bool              `json:"open_when_done,omitempty"`
 	Total        int64             `json:"total"`
 	RangeOK      bool              `json:"range_ok"`
+	Alone        bool              `json:"alone,omitempty"`
 	CategoryName string            `json:"category_name,omitempty"`
 	Queue        string            `json:"queue,omitempty"`
 	Description  string            `json:"description,omitempty"`
@@ -638,7 +830,7 @@ func (d *Download) State() State {
 		BaseDir: d.BaseDir, Headers: d.Headers, Connections: d.Connections, SpeedLimit: d.SpeedLimit,
 		OpenWhenDone: d.OpenWhenDone, CategoryName: d.CategoryName,
 		Queue: d.Queue, Description: d.Description, Order: d.Order,
-		Total: d.Total, RangeOK: d.RangeOK, Status: status, Err: d.Err,
+		Total: d.Total, RangeOK: d.RangeOK, Alone: d.alone, Status: status, Err: d.Err,
 		Chunks: chunks, CreatedAt: d.CreatedAt, UpdatedAt: time.Now(),
 	}
 }
@@ -658,6 +850,7 @@ func Restore(s State, client *http.Client) *Download {
 	d.Dir = s.Dir
 	d.Total = s.Total
 	d.RangeOK = s.RangeOK
+	d.alone = s.Alone
 	d.OpenWhenDone = s.OpenWhenDone
 	d.CategoryName = s.CategoryName
 	d.Queue = s.Queue
