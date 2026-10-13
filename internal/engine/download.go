@@ -87,6 +87,10 @@ type Download struct {
 	// its verdict on the manifest is cached.
 	guarded, guardedFrom *http.Client
 	guardedFor           string
+
+	// stallTimeout overrides DefaultStallTimeout when set. Tests use a
+	// short value; a zero value means the default.
+	stallTimeout time.Duration
 }
 
 // New creates a queued download. Probing happens on the first Start.
@@ -506,7 +510,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		n, rerr := resp.Body.Read(buf)
+		n, rerr := readWithIdle(ctx, resp.Body, buf, d.readStall())
 		if n > 0 {
 			d.mu.Lock()
 			limit := ch.End
@@ -539,6 +543,46 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 	}
 	return nil
+}
+
+// errStalled means the response body produced no bytes within the idle limit.
+// The chunk is retried from the last byte written. A pause is not a stall:
+// the caller returns the context error before counting a retry.
+var errStalled = errors.New("connection stalled")
+
+func (d *Download) readStall() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stallTimeout > 0 {
+		return d.stallTimeout
+	}
+	return DefaultStallTimeout
+}
+
+// readWithIdle returns the next read, or errStalled when idle elapses with
+// no bytes. Closing the body unblocks a Read left behind in that case.
+func readWithIdle(ctx context.Context, body io.ReadCloser, buf []byte, idle time.Duration) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := body.Read(buf)
+		done <- result{n, err}
+	}()
+	timer := time.NewTimer(idle)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		_ = body.Close()
+		return 0, ctx.Err()
+	case <-timer.C:
+		_ = body.Close()
+		return 0, errStalled
+	case res := <-done:
+		return res.n, res.err
+	}
 }
 
 func (d *Download) finish() error {

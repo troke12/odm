@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNewPlanCoversFileWithoutGaps(t *testing.T) {
@@ -121,6 +122,75 @@ func TestSegmentedDownloadMultiConnection(t *testing.T) {
 	}
 	if !info.RangeOK {
 		t.Fatal("expected range support to be detected")
+	}
+}
+
+func TestStalledConnectionRetriesFromLastByte(t *testing.T) {
+	data := make([]byte, 200*1024)
+	for i := range data {
+		data[i] = byte(i * 17)
+	}
+	var transfers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		spec := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+		parts := strings.SplitN(spec, "-", 2)
+		start, _ := strconv.Atoi(parts[0])
+		end := len(data) - 1
+		explicit := len(parts) == 2 && parts[1] != ""
+		if explicit {
+			if v, err := strconv.Atoi(parts[1]); err == nil {
+				end = v
+			}
+		}
+		if end >= len(data) {
+			end = len(data) - 1
+		}
+		if start < 0 || start > end {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		body := data[start : end+1]
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		// The size probe uses an open-ended range and does not read the body.
+		if !explicit {
+			return
+		}
+		if transfers.Add(1) == 1 {
+			const first = 4096
+			if _, err := w.Write(data[start : start+first]); err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	d := New("stall", srv.URL+"/stall.bin", dir, 1, nil, 0, srv.Client())
+	d.stallTimeout = 200 * time.Millisecond
+	d.Start(context.Background())
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if transfers.Load() < 2 {
+		t.Fatalf("stalled connection was not retried, transfers=%d", transfers.Load())
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("bytes after a stalled connection do not match")
 	}
 }
 

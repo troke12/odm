@@ -6,6 +6,12 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- A connection that receives no bytes for 30 seconds is closed and its chunk
+  is retried from the last written offset. Other connections of the same file
+  keep going.
+
 ### Fixed
 
 - With ODM not running, the browser extension started a native host for
