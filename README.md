@@ -17,6 +17,8 @@ queues. It runs as a desktop app, or headless with a JSON API.
 - Resume after a pause, crash or restart from the exact byte offset. If a
   link expires, give the download a new address and it continues where it
   stopped, as long as the new address serves the same file.
+- A connection that closes before its chunk is finished retries from the
+  last byte written, and stops after the retry limit.
 - Servers that do not support ranges are fetched on a single stream.
 - Global and per-download speed limits, plus an optional data cap per time
   window.

@@ -53,11 +53,14 @@ type Download struct {
 	// yet (the manager has dispatched the download but Start has not run), so
 	// Start honours it instead of the pause being silently dropped.
 	pauseReq bool
-	file     *os.File
-	cookies  []*http.Cookie
-	auth     func(host string) (string, string, bool)
-	catDirs  map[string]string
-	onUpdate func(*Download)
+	// retryBase is the first pause between attempts. Tests set a short
+	// value. Zero keeps the 300ms default.
+	retryBase time.Duration
+	file      *os.File
+	cookies   []*http.Cookie
+	auth      func(host string) (string, string, bool)
+	catDirs   map[string]string
+	onUpdate  func(*Download)
 
 	lastDone int64
 	lastAt   time.Time
@@ -385,7 +388,7 @@ func (d *Download) trySplit() *Chunk {
 
 func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 	var err error
-	backoff := 300 * time.Millisecond
+	backoff := d.retryDelay()
 	for attempt := 0; attempt < MaxRetries; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -460,6 +463,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 
 	buf := make([]byte, 64*1024)
 	pos := start
+	early := false
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -491,12 +495,35 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
+				early = true
 				break
 			}
 			return rerr
 		}
 	}
+	if !early {
+		return nil
+	}
+	d.mu.Lock()
+	complete := ch.Complete()
+	d.mu.Unlock()
+	if !complete {
+		return errShortBody
+	}
 	return nil
+}
+
+// errShortBody means the response ended before every byte of the chunk was
+// written. The chunk is retried from the last byte written.
+var errShortBody = errors.New("connection closed early")
+
+func (d *Download) retryDelay() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.retryBase > 0 {
+		return d.retryBase
+	}
+	return 300 * time.Millisecond
 }
 
 func (d *Download) finish() error {

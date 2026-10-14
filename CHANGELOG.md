@@ -6,6 +6,12 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- A connection that closes before its chunk is finished retries from the
+  last byte written. The retry uses the usual pause and stops after the
+  retry limit.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added
