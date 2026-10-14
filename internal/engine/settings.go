@@ -106,6 +106,10 @@ type Settings struct {
 	// NoCloseToTray makes closing the main window quit instead of hiding it
 	// to the system tray (where downloads keep running).
 	NoCloseToTray bool `json:"no_close_to_tray,omitempty"`
+	// FFmpegPath points at ffmpeg (the program or its folder), used to join
+	// streams that come as separate video and audio. Empty: look next to
+	// ODM, then on PATH.
+	FFmpegPath string `json:"ffmpeg_path,omitempty"`
 }
 
 // DefaultQueue is the queue used when none is specified.

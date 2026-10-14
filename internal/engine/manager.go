@@ -66,6 +66,7 @@ type Manager struct {
 func NewManager(settings Settings, settingsPath string) *Manager {
 	settings.normalize(settings.Dir)
 	setUserAgent(settings.UserAgent)
+	setFFmpegPath(settings.FFmpegPath)
 	return &Manager{
 		downloads: map[string]*Download{},
 		running:   map[string]bool{},
@@ -280,6 +281,7 @@ func (m *Manager) UpdateSettings(next Settings) Settings {
 
 	m.limiter.SetRate(next.SpeedLimit)
 	setUserAgent(next.UserAgent)
+	setFFmpegPath(next.FFmpegPath)
 	if path != "" {
 		_ = SaveSettings(path, next)
 	}
@@ -611,6 +613,9 @@ type AddOptions struct {
 	FileName     string
 	Queue        string
 	Description  string
+	// Stream makes this a segmented (HLS/DASH) download; URL is then the
+	// manifest the stream was found at.
+	Stream *StreamJob
 }
 
 // Create queues a download from opts and returns its projection.
@@ -638,6 +643,10 @@ func (m *Manager) Create(o AddOptions) Info {
 	d.OpenWhenDone = o.OpenWhenDone
 	d.Queue = queue
 	d.Description = o.Description
+	if o.Stream != nil {
+		sj := *o.Stream
+		d.Stream = &sj
+	}
 	d.SetCategoryDirs(st.CategoryDirs)
 	d.SetLimiter(m.limiter)
 	d.SetAuthLookup(m.credentials)
@@ -742,7 +751,30 @@ func (m *Manager) Readdress(ctx context.Context, id, newURL string) error {
 	}
 	d.mu.Lock()
 	headers, total, done, probed := d.Headers, d.Total, d.doneLocked(), len(d.Chunks) > 0
+	stream := d.Stream != nil
+	if stream && d.Stream.Video != "" && d.Stream.Variant == "" {
+		// Added with a fixed media playlist: nothing identifies which
+		// rendition of a new manifest would be the same one.
+		d.mu.Unlock()
+		return fmt.Errorf("this stream was added from a fixed playlist; add the new address as a new download")
+	}
+	if stream {
+		// A stream re-reads its manifest on every run, and the segment
+		// counts (kept) stop a different stream from being mixed in. The
+		// pinned rendition is kept too, so the new manifest must offer
+		// the same one.
+		d.URL, d.FinalURL = newURL, ""
+		d.Stream.Manifest = newURL
+		d.Stream.Video, d.Stream.Audio = "", ""
+		if d.Status == StatusError {
+			d.Status, d.Err = StatusPaused, ""
+		}
+	}
 	d.mu.Unlock()
+	if stream {
+		m.changed(d)
+		return nil
+	}
 
 	if !probed { // never started: the next start probes the new address
 		d.mu.Lock()
@@ -886,6 +918,9 @@ func (m *Manager) RemoveWithFile(id string, deleteFile bool) bool {
 		return false
 	}
 	d.Pause()
+	// Let workers (and a stream's assembly) close their files first; on
+	// Windows an open file cannot be deleted and the error is ignored.
+	d.waitIdle(10 * time.Second)
 	d.mu.Lock()
 	dir, name := d.Dir, d.FileName
 	f := d.file
@@ -907,6 +942,8 @@ func (m *Manager) RemoveWithFile(id string, deleteFile bool) bool {
 
 	if name != "" {
 		_ = os.Remove(filepath.Join(dir, name+".odmpart"))
+		// A stream keeps its segments in a folder as big as the video.
+		_ = os.RemoveAll(filepath.Join(dir, name+".odmparts"))
 		if deleteFile {
 			_ = os.Remove(filepath.Join(dir, name))
 		}

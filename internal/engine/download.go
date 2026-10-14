@@ -39,6 +39,8 @@ type Download struct {
 	Status  Status
 	Err     string
 	Chunks  []*Chunk
+	// Stream is set for a segmented (HLS/DASH) download; see stream.go.
+	Stream *StreamJob
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -61,6 +63,13 @@ type Download struct {
 	lastAt   time.Time
 	speed    int64
 	notifyAt time.Time
+
+	// runDone is closed when the current Start returns (nil before any).
+	runDone chan struct{}
+
+	// Segmented downloads: bytes on disk, and segments present / total.
+	streamDone             int64
+	streamHave, streamSegs int
 }
 
 // New creates a queued download. Probing happens on the first Start.
@@ -136,6 +145,11 @@ func (d *Download) SetOnUpdate(fn func(*Download)) { d.onUpdate = fn }
 // Start runs the transfer to completion, pause or error. It blocks.
 func (d *Download) Start(parent context.Context) {
 	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	d.mu.Lock()
+	d.runDone = done
+	d.mu.Unlock()
+	defer close(done)
 	defer func() {
 		cancel()
 		d.mu.Lock()
@@ -159,6 +173,12 @@ func (d *Download) Start(parent context.Context) {
 	d.lastAt = time.Now()
 	d.mu.Unlock()
 	d.notify(true)
+
+	if d.Stream != nil {
+		d.runStream(ctx)
+		d.notify(true)
+		return
+	}
 
 	if err := d.prepare(ctx); err != nil {
 		// A cancelled context means pause (or shutdown) during the probe, not
@@ -276,7 +296,9 @@ func (d *Download) openTarget(fresh bool) error {
 	d.Dir = dir
 	final := filepath.Join(dir, d.FileName)
 	tmp := final + ".odmpart"
-	rangeOK, total := d.RangeOK, d.Total
+	// A stream assembles its file at the end; pre-sizing it would only
+	// double the disk space used while the segments are on disk too.
+	rangeOK, total := d.RangeOK && d.Stream == nil, d.Total
 	d.mu.Unlock()
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -579,6 +601,22 @@ func (d *Download) Pause() {
 	}
 }
 
+// waitIdle waits up to timeout for a running Start to return, so its
+// files are closed before someone deletes them (Windows refuses to delete
+// open files).
+func (d *Download) waitIdle(timeout time.Duration) {
+	d.mu.Lock()
+	done := d.runDone
+	d.mu.Unlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
 // Sample recomputes the transfer speed; call roughly once per second.
 func (d *Download) Sample() {
 	d.mu.Lock()
@@ -589,6 +627,9 @@ func (d *Download) Sample() {
 		dt := now.Sub(d.lastAt).Seconds()
 		if dt > 0 {
 			d.speed = int64(float64(done-d.lastDone) / dt)
+			if d.speed < 0 { // a stream drops a failed segment's bytes
+				d.speed = 0
+			}
 		}
 	}
 	d.lastDone, d.lastAt = done, now
@@ -615,6 +656,7 @@ type State struct {
 	Status       Status            `json:"status"`
 	Err          string            `json:"error,omitempty"`
 	Chunks       []*Chunk          `json:"chunks"`
+	Stream       *StreamJob        `json:"stream,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
 }
@@ -629,6 +671,13 @@ func (d *Download) State() State {
 		cc.claimed = false
 		chunks[i] = &cc
 	}
+	var stream *StreamJob
+	if d.Stream != nil {
+		sj := *d.Stream
+		sj.Counts = append([]int(nil), d.Stream.Counts...)
+		sj.Done = d.streamDone
+		stream = &sj
+	}
 	status := d.Status
 	if status == StatusDownloading {
 		status = StatusPaused
@@ -639,7 +688,7 @@ func (d *Download) State() State {
 		OpenWhenDone: d.OpenWhenDone, CategoryName: d.CategoryName,
 		Queue: d.Queue, Description: d.Description, Order: d.Order,
 		Total: d.Total, RangeOK: d.RangeOK, Status: status, Err: d.Err,
-		Chunks: chunks, CreatedAt: d.CreatedAt, UpdatedAt: time.Now(),
+		Chunks: chunks, Stream: stream, CreatedAt: d.CreatedAt, UpdatedAt: time.Now(),
 	}
 }
 
@@ -664,6 +713,13 @@ func Restore(s State, client *http.Client) *Download {
 	d.Description = s.Description
 	d.Order = s.Order
 	d.Chunks = s.Chunks
+	d.Stream = s.Stream
+	if s.Stream != nil {
+		d.streamDone = s.Stream.Done
+		if s.Status == StatusComplete {
+			d.streamDone = s.Total
+		}
+	}
 	d.Err = s.Err
 	d.CreatedAt = s.CreatedAt
 	switch s.Status {
@@ -742,7 +798,7 @@ func (d *Download) doneBytes() int64 {
 }
 
 func (d *Download) doneLocked() int64 {
-	var done int64
+	done := d.streamDone
 	for _, c := range d.Chunks {
 		done += c.Done
 	}

@@ -1,0 +1,5 @@
+#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXT-X-KEY:METHOD=SAMPLE-AES,URI="skd://key-id",KEYFORMAT="com.apple.streamingkeydelivery",KEYFORMATVERSIONS="1"
+#EXTINF:4,
+a.ts

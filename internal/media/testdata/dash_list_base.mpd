@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT1M">
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="list" bandwidth="500000">
+        <BaseURL>list/file.mp4</BaseURL>
+        <SegmentList timescale="1" duration="30">
+          <Initialization range="0-799"/>
+          <SegmentURL mediaRange="800-50799"/>
+          <SegmentURL media="part2.mp4"/>
+        </SegmentList>
+      </Representation>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4">
+      <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc"/>
+      <Representation id="whole" bandwidth="64000">
+        <BaseURL>audio/whole.m4a</BaseURL>
+        <SegmentBase indexRange="700-899"><Initialization range="0-699"/></SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- number-based SegmentTemplate inherited from the AdaptationSet -->
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT0H0M10.5S" minBufferTime="PT2S" profiles="urn:mpeg:dash:profile:isoff-live:2011">
+  <BaseURL>media/</BaseURL>
+  <Period id="p0">
+    <AdaptationSet mimeType="video/mp4" codecs="avc1.4d401f" frameRate="30000/1001">
+      <SegmentTemplate media="$RepresentationID$/seg-$Number%05d$.m4s" initialization="$RepresentationID$/init.mp4" startNumber="1" timescale="1000" duration="4000"/>
+      <Representation id="v720" bandwidth="2400000" width="1280" height="720"/>
+      <Representation id="v1080" bandwidth="4800000" width="1920" height="1080" codecs="avc1.640028"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" lang="en">
+      <SegmentTemplate media="a/$Bandwidth$/$Number$.m4s$$" initialization="a/init.mp4" timescale="48000" duration="192000"/>
+      <Representation id="a128" bandwidth="128000" codecs="mp4a.40.2"/>
+    </AdaptationSet>
+  </Period>
+</MPD>
