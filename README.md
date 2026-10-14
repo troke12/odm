@@ -17,6 +17,9 @@ queues. It runs as a desktop app, or headless with a JSON API.
 - Resume after a pause, crash or restart from the exact byte offset. If a
   link expires, give the download a new address and it continues where it
   stopped, as long as the new address serves the same file.
+- Range requests ask for the raw bytes (`Accept-Encoding: identity`), so a
+  compressed response is not written in place of the file. A header set on
+  the download itself is left as it is.
 - Servers that do not support ranges are fetched on a single stream.
 - Global and per-download speed limits, plus an optional data cap per time
   window.
@@ -184,8 +187,8 @@ only.
 2. **Plan.** The file is split into up to N chunks of at least 64 KiB. A tiny
    last chunk is merged into the one before it.
 3. **Transfer.** N workers each take a chunk and write it into the `.odmpart`
-   file at its absolute offset. A worker that finishes early takes over half
-   of the largest remaining chunk.
+   file at its absolute offset. Each range request asks for the raw bytes.
+   A worker that finishes early takes over half of the largest remaining chunk.
 4. **Finish.** The `.odmpart` file is renamed to the final name.
 
 Each chunk's progress (`{id,start,end,done}`) is saved as JSON, so a restart

@@ -6,6 +6,12 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Range requests send `Accept-Encoding: identity`, so the bytes written to
+  disk are the file itself. An `Accept-Encoding` header set on the download
+  is left as it is.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added
