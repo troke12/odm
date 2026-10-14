@@ -30,7 +30,9 @@ func Inspect(ctx context.Context, client *http.Client, rawURL string, headers ma
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Range", "bytes=0-")
+	// One byte. A range that covers the whole file may be answered with 200,
+	// which would hide that the server supports ranges.
+	req.Header.Set("Range", "bytes=0-0")
 	req.Header.Set("Accept-Encoding", "identity")
 	applyHeaders(req, headers)
 

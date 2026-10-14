@@ -179,8 +179,8 @@ only.
 
 ## How a download works
 
-1. **Probe.** A ranged `GET bytes=0-` returns the file size, range support, file
-   name, cookies and validators.
+1. **Probe.** A ranged `GET bytes=0-0` returns the file size, range support,
+   file name, cookies and validators.
 2. **Plan.** The file is split into up to N chunks of at least 64 KiB. A tiny
    last chunk is merged into the one before it.
 3. **Transfer.** N workers each take a chunk and write it into the `.odmpart`

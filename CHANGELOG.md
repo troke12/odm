@@ -6,6 +6,12 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- The size probe requests the first byte (`Range: bytes=0-0`). A server that
+  answers 200 for a range covering the whole file is still segmented when
+  that one-byte request returns 206.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added
