@@ -45,7 +45,10 @@ type Download struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 
-	client  *http.Client
+	client *http.Client
+	// h1 serves several ranges at once over HTTP/1.1. The shared client may
+	// use HTTP/2, which would put every range on one socket.
+	h1      *http.Client
 	limiter *Limiter
 	shared  *Limiter
 	cancel  context.CancelFunc
@@ -417,10 +420,12 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	}
 	start, end := ch.Next(), ch.End
 	rangeOK := d.RangeOK
+	conns := d.Connections
 	finalURL := d.FinalURL
 	headers := d.Headers
 	cookies := d.cookies
 	d.mu.Unlock()
+	client := d.segmentClient(rangeOK, conns)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
 	if err != nil {
@@ -441,7 +446,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		req.Header.Set("Cookie", cookieHeader(cookies))
 	}
 
-	resp, err := d.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -497,6 +502,34 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 	}
 	return nil
+}
+
+// segmentClient returns the HTTP/1.1 client when more than one ranged
+// connection will run. One stream keeps the shared client.
+func (d *Download) segmentClient(rangeOK bool, conns int) *http.Client {
+	if d.client == nil || !rangeOK || conns <= 1 {
+		return d.client
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.h1 != nil {
+		return d.h1
+	}
+	var base *http.Transport
+	if d.client.Transport != nil {
+		tr, ok := d.client.Transport.(*http.Transport)
+		if !ok {
+			return d.client
+		}
+		base = tr
+	}
+	d.h1 = &http.Client{
+		Transport:     segmentTransport(base),
+		CheckRedirect: d.client.CheckRedirect,
+		Jar:           d.client.Jar,
+		Timeout:       d.client.Timeout,
+	}
+	return d.h1
 }
 
 func (d *Download) finish() error {
