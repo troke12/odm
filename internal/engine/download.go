@@ -53,11 +53,14 @@ type Download struct {
 	// yet (the manager has dispatched the download but Start has not run), so
 	// Start honours it instead of the pause being silently dropped.
 	pauseReq bool
-	file     *os.File
-	cookies  []*http.Cookie
-	auth     func(host string) (string, string, bool)
-	catDirs  map[string]string
-	onUpdate func(*Download)
+	// beforeWrite runs after a filled buffer is in hand and before it is
+	// written. Tests move the chunk end in that window. Nil otherwise.
+	beforeWrite func()
+	file        *os.File
+	cookies     []*http.Cookie
+	auth        func(host string) (string, string, bool)
+	catDirs     map[string]string
+	onUpdate    func(*Download)
 
 	lastDone int64
 	lastAt   time.Time
@@ -466,23 +469,33 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			if d.beforeWrite != nil {
+				d.beforeWrite()
+			}
+			// The end can move while this buffer is in hand: another
+			// connection may have taken the tail. Count and write only the
+			// bytes that still belong to this chunk.
 			d.mu.Lock()
 			limit := ch.End
 			d.mu.Unlock()
-			if limit >= 0 && pos+int64(n) > limit+1 {
-				n = int(limit + 1 - pos)
-			}
-			if n > 0 {
-				if _, werr := d.file.WriteAt(buf[:n], pos); werr != nil {
+			writeN := ownedSpan(pos, n, limit)
+			if writeN > 0 {
+				if _, werr := d.file.WriteAt(buf[:writeN], pos); werr != nil {
 					return werr
 				}
-				pos += int64(n)
 				d.mu.Lock()
-				ch.Done += int64(n)
+				counted := ownedSpan(pos, writeN, ch.End)
+				if counted > 0 {
+					ch.Done += int64(counted)
+				}
+				limit = ch.End
 				d.mu.Unlock()
+				pos += int64(counted)
 				d.notify(false)
-				if werr := d.limiter.Wait(ctx, n); werr != nil {
-					return werr
+				if counted > 0 {
+					if werr := d.limiter.Wait(ctx, counted); werr != nil {
+						return werr
+					}
 				}
 			}
 			if limit >= 0 && pos > limit {
@@ -497,6 +510,22 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		}
 	}
 	return nil
+}
+
+// ownedSpan is how many of the n bytes at pos still fall inside a chunk
+// whose inclusive end is limit. A negative limit means the end is open.
+func ownedSpan(pos int64, n int, limit int64) int {
+	if n <= 0 {
+		return 0
+	}
+	if limit < 0 || pos+int64(n) <= limit+1 {
+		return n
+	}
+	remain := limit + 1 - pos
+	if remain <= 0 {
+		return 0
+	}
+	return int(remain)
 }
 
 func (d *Download) finish() error {
