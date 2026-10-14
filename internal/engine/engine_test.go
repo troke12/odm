@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestNewPlanCoversFileWithoutGaps(t *testing.T) {
@@ -54,6 +55,74 @@ func TestSplitShrinksVictimAndKeepsCoverage(t *testing.T) {
 	}
 	if _, ok := Split([]*Chunk{{ID: 0, Start: 0, End: MinChunkSize - 1}}, MinChunkSize); ok {
 		t.Fatal("tiny chunk must not split")
+	}
+}
+
+func TestSplitPrefersTheSlowerChunk(t *testing.T) {
+	fast := &Chunk{ID: 0, Start: 0, End: 8<<20 - 1, pace: 1 << 20}        // 8 MiB at 1 MiB/s
+	slow := &Chunk{ID: 1, Start: 8 << 20, End: 9<<20 - 1, pace: 16 << 10} // 1 MiB at 16 KiB/s
+	fastEnd := fast.End
+	nc, ok := Split([]*Chunk{fast, slow}, MinChunkSize)
+	if !ok {
+		t.Fatal("expected a split")
+	}
+	if fast.End != fastEnd {
+		t.Fatalf("fast chunk was split, end %d", fast.End)
+	}
+	if nc.Start != slow.End+1 || slow.End >= 9<<20-1 {
+		t.Fatalf("slow chunk end %d, new start %d", slow.End, nc.Start)
+	}
+	if nc.End != 9<<20-1 {
+		t.Fatalf("new chunk end %d", nc.End)
+	}
+}
+
+func TestSplitKeepsLargestWhenPacesMatch(t *testing.T) {
+	// 5 MiB and 4 MiB at the same pace. The longer one is not twice as slow,
+	// so the split stays on the larger remainder.
+	big := &Chunk{ID: 0, Start: 0, End: 5<<20 - 1, pace: 1 << 20}
+	small := &Chunk{ID: 1, Start: 5 << 20, End: 9<<20 - 1, pace: 1 << 20}
+	smallEnd := small.End
+	nc, ok := Split([]*Chunk{big, small}, MinChunkSize)
+	if !ok {
+		t.Fatal("expected a split")
+	}
+	if small.End != smallEnd {
+		t.Fatalf("smaller chunk was split, end %d", small.End)
+	}
+	if nc.Start != big.End+1 {
+		t.Fatalf("new chunk does not follow the larger chunk (%d, end %d)", nc.Start, big.End)
+	}
+}
+
+func TestSplitKeepsLargestWhenOnlyALittleSlower(t *testing.T) {
+	// 8 MiB at 2 MiB/s finishes in 4s. 3 MiB at 512 KiB/s finishes in 6s.
+	// Six seconds is not twice four, so the larger remainder is still split.
+	big := &Chunk{ID: 0, Start: 0, End: 8<<20 - 1, pace: 2 << 20}
+	small := &Chunk{ID: 1, Start: 8 << 20, End: 11<<20 - 1, pace: 512 << 10}
+	smallEnd := small.End
+	nc, ok := Split([]*Chunk{big, small}, MinChunkSize)
+	if !ok {
+		t.Fatal("expected a split")
+	}
+	if small.End != smallEnd {
+		t.Fatalf("slightly slower chunk was split, end %d", small.End)
+	}
+	if nc.Start != big.End+1 {
+		t.Fatalf("new chunk does not follow the larger chunk (%d, end %d)", nc.Start, big.End)
+	}
+}
+
+func TestNotePaceNeedsAWindow(t *testing.T) {
+	c := &Chunk{}
+	start := time.Unix(0, 0)
+	c.notePace(1000, start)
+	if c.pace != 0 {
+		t.Fatalf("pace %d before the window", c.pace)
+	}
+	c.notePace(1000, start.Add(paceWindow))
+	if c.pace != 10000 {
+		t.Fatalf("pace = %d, want 10000", c.pace)
 	}
 }
 

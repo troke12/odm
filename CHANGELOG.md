@@ -6,6 +6,12 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- An idle connection takes the tail of the chunk that will take the longest
+  to finish, once that chunk is at least twice as slow as the fastest one.
+  Until a pace is known, the largest remainder is used.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added
