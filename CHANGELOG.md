@@ -6,6 +6,11 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- Connections open one at a time. The next connection starts after every
+  connection already open has stored file bytes, up to the configured limit.
+
 ## [0.2.0] - 2026-10-13
 
 ### Added

@@ -183,9 +183,11 @@ only.
    name, cookies and validators.
 2. **Plan.** The file is split into up to N chunks of at least 64 KiB. A tiny
    last chunk is merged into the one before it.
-3. **Transfer.** N workers each take a chunk and write it into the `.odmpart`
-   file at its absolute offset. A worker that finishes early takes over half
-   of the largest remaining chunk.
+3. **Transfer.** Workers write each chunk into the `.odmpart` file at its
+   absolute offset. The first connection opens immediately. Another opens
+   after every connection already running has stored file bytes, up to the
+   configured limit. A worker that finishes early takes over half of the
+   largest remaining chunk.
 4. **Finish.** The `.odmpart` file is renamed to the final name.
 
 Each chunk's progress (`{id,start,end,done}`) is saved as JSON, so a restart
