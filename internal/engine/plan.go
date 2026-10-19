@@ -1,5 +1,10 @@
 package engine
 
+import (
+	"math"
+	"time"
+)
+
 // NewPlan splits [0,total) into at most conns chunks. total<=0 (unknown size)
 // yields a single open-ended chunk that is filled sequentially.
 func NewPlan(total int64, conns int) []*Chunk {
@@ -37,6 +42,11 @@ func NewPlan(total int64, conns int) []*Chunk {
 // least twice as long. Otherwise the largest remainder is chosen.
 // It reports false when no chunk is big enough to split safely.
 func Split(chunks []*Chunk, minChunk int64) (*Chunk, bool) {
+	return splitAt(chunks, minChunk, time.Now())
+}
+
+// splitAt is Split with the time paces are judged at.
+func splitAt(chunks []*Chunk, minChunk int64, now time.Time) (*Chunk, bool) {
 	var largest, slow *Chunk
 	var bestRemain int64
 	var slowETA, fastETA float64
@@ -56,10 +66,15 @@ func Split(chunks []*Chunk, minChunk int64) (*Chunk, bool) {
 		if r > bestRemain {
 			bestRemain, largest = r, c
 		}
-		if c.pace <= 0 {
+		pace, known := c.currentPace(now)
+		if !known {
 			continue
 		}
-		eta := float64(r) / float64(c.pace)
+		// A connection that has gone quiet never finishes on its own.
+		eta := math.Inf(1)
+		if pace > 0 {
+			eta = float64(r) / float64(pace)
+		}
 		paced++
 		if slow == nil || eta > slowETA {
 			slow, slowETA = c, eta

@@ -35,6 +35,9 @@ const (
 	// paceWindow is how long a chunk's writes are collected before its pace
 	// is updated. One fast read does not decide that a connection is quick.
 	paceWindow = 200 * time.Millisecond
+	// paceStall is how long a response may go without its first byte
+	// before its chunk counts as stalled (pace 0) for a split.
+	paceStall = 5 * paceWindow
 )
 
 // Chunk is one contiguous, inclusive byte range of the target file.
@@ -50,6 +53,8 @@ type Chunk struct {
 	pace      int64
 	paceBytes int64
 	paceAt    time.Time
+	// fetchAt is when the current response for this chunk was asked for.
+	fetchAt time.Time
 }
 
 // Size is the number of bytes the chunk covers.
@@ -63,6 +68,39 @@ func (c *Chunk) Complete() bool { return c.Done >= c.Size() }
 
 // Next is the absolute file offset the next read should write to.
 func (c *Chunk) Next() int64 { return c.Start + c.Done }
+
+// startPace begins measuring a new response: a pace from an earlier one
+// (before a pause or a retry) says nothing about this connection, and its
+// window would divide by the time in between.
+func (c *Chunk) startPace(now time.Time) {
+	c.pace, c.paceBytes, c.paceAt, c.fetchAt = 0, 0, time.Time{}, now
+}
+
+// currentPace is the chunk's pace as of now, and whether it is known. It
+// decays while no bytes arrive: notePace only runs when bytes come in, so a
+// hung socket would otherwise keep its last good pace forever. A response
+// without its first byte for paceStall is known to be at 0.
+func (c *Chunk) currentPace(now time.Time) (int64, bool) {
+	if c.paceAt.IsZero() {
+		if c.pace > 0 {
+			return c.pace, true
+		}
+		if !c.fetchAt.IsZero() && now.Sub(c.fetchAt) >= paceStall {
+			return 0, true
+		}
+		return 0, false
+	}
+	// Bytes since the last update over the time since: once that span is a
+	// full window, it caps the pace, falling toward 0 while the socket is
+	// quiet.
+	if idle := now.Sub(c.paceAt); idle >= paceWindow {
+		recent := int64(float64(c.paceBytes) / idle.Seconds())
+		if c.pace == 0 || recent < c.pace {
+			return recent, true
+		}
+	}
+	return c.pace, c.pace > 0
+}
 
 // notePace folds n newly written bytes into the chunk's recent pace.
 func (c *Chunk) notePace(n int64, now time.Time) {

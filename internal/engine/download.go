@@ -642,7 +642,7 @@ func (d *Download) trySplit() *Chunk {
 	if d.alone {
 		return nil
 	}
-	nc, ok := Split(d.Chunks, MinChunkSize)
+	nc, ok := splitAt(d.Chunks, MinChunkSize, time.Now())
 	if !ok {
 		return nil
 	}
@@ -690,6 +690,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		return nil
 	}
 	start, end := ch.Next(), ch.End
+	ch.startPace(time.Now())
 	rangeOK := d.RangeOK
 	conns := d.Connections
 	if d.alone {

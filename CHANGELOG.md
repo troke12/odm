@@ -32,7 +32,8 @@ All notable changes to ODM are documented here. The format is based on
   so each connection has its own socket. A single stream can still use HTTP/2.
 - An idle connection takes the tail of the chunk that will take the longest
   to finish, once that chunk is at least twice as slow as the fastest one.
-  Until a pace is known, the largest remainder is used.
+  A connection that has gone quiet counts as the slowest. Until a pace is
+  known, the largest remainder is used.
 
 ## [0.4.3] - 2026-10-19
 

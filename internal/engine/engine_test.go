@@ -114,6 +114,62 @@ func TestSplitKeepsLargestWhenOnlyALittleSlower(t *testing.T) {
 	}
 }
 
+// A connection that went quiet keeps the pace it had, unless the pace
+// decays with the time since its last bytes. It must be picked as the
+// slowest even though it was fast and its remainder is the smaller one.
+func TestSplitPicksAStalledChunk(t *testing.T) {
+	now := time.Unix(1000, 0)
+	busy := &Chunk{ID: 0, Start: 0, End: 8<<20 - 1, pace: 1 << 20,
+		paceAt: now.Add(-50 * time.Millisecond), paceBytes: 50 << 10}
+	quiet := &Chunk{ID: 1, Start: 8 << 20, End: 10<<20 - 1, pace: 4 << 20,
+		paceAt: now.Add(-10 * time.Second)} // no byte for 10 s
+	quietEnd := quiet.End
+	nc, ok := splitAt([]*Chunk{busy, quiet}, MinChunkSize, now)
+	if !ok {
+		t.Fatal("expected a split")
+	}
+	if quiet.End == quietEnd || nc.Start != quiet.End+1 {
+		t.Fatalf("the stalled chunk was not split (end %d, new start %d)", quiet.End, nc.Start)
+	}
+}
+
+// A response that has not brought its first byte after paceStall is a
+// stalled connection too, not an unknown one to skip.
+func TestSplitPicksAChunkWithNoBytesYet(t *testing.T) {
+	now := time.Unix(1000, 0)
+	busy := &Chunk{ID: 0, Start: 0, End: 8<<20 - 1, pace: 1 << 20}
+	waiting := &Chunk{ID: 1, Start: 8 << 20, End: 10<<20 - 1, fetchAt: now.Add(-2 * paceStall)}
+	nc, ok := splitAt([]*Chunk{busy, waiting}, MinChunkSize, now)
+	if !ok {
+		t.Fatal("expected a split")
+	}
+	if nc.Start != waiting.End+1 {
+		t.Fatalf("the chunk without bytes was not split (new start %d)", nc.Start)
+	}
+	// Before paceStall it is still unknown, and the largest remainder wins.
+	busy2 := &Chunk{ID: 0, Start: 0, End: 8<<20 - 1, pace: 1 << 20}
+	fresh := &Chunk{ID: 1, Start: 8 << 20, End: 10<<20 - 1, fetchAt: now.Add(-paceWindow)}
+	nc, ok = splitAt([]*Chunk{busy2, fresh}, MinChunkSize, now)
+	if !ok || nc.Start != busy2.End+1 {
+		t.Fatal("a response just asked for was treated as stalled")
+	}
+}
+
+// A new response starts a new measurement: the first window after a pause
+// must not divide by the time the download was paused.
+func TestStartPaceForgetsTheEarlierResponse(t *testing.T) {
+	c := &Chunk{}
+	t0 := time.Unix(0, 0)
+	c.notePace(1000, t0)
+	resume := t0.Add(10 * time.Second)
+	c.startPace(resume)
+	c.notePace(1000, resume)
+	c.notePace(1000, resume.Add(paceWindow))
+	if c.pace != 10000 {
+		t.Fatalf("pace = %d, want 10000 (2000 bytes over one window)", c.pace)
+	}
+}
+
 func TestNotePaceNeedsAWindow(t *testing.T) {
 	c := &Chunk{}
 	start := time.Unix(0, 0)
