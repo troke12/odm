@@ -359,20 +359,43 @@ func (d *Download) applyProbe(p *Probe) {
 
 // revalidate runs before a resume. When the saved ETag, Last-Modified or
 // size no longer matches, the partial file is discarded and planned again.
+//
+// It asks the address the transfer itself uses (FinalURL, with the cookies
+// the first probe got), as a resume did before this check existed: a
+// short-lived redirect or token link may no longer work from d.URL. A probe
+// that fails is not fatal for the same reason; the resume goes on as it
+// used to, and If-Range on every ranged request still catches a changed
+// file. A refusal by the local-network guard is final, as everywhere.
 func (d *Download) revalidate(ctx context.Context) error {
 	d.mu.Lock()
-	rawURL, headers := d.URL, d.Headers
+	rawURL := d.FinalURL
+	if rawURL == "" {
+		rawURL = d.URL
+	}
+	headers := make(map[string]string, len(d.Headers)+1)
+	for k, v := range d.Headers {
+		headers[k] = v
+	}
+	if len(d.cookies) > 0 {
+		headers["Cookie"] = cookieHeader(d.cookies)
+	}
 	etag, modified, total, ranged := d.ETag, d.LastModified, d.Total, d.RangeOK
 	done := d.doneLocked()
 	d.mu.Unlock()
 
-	p, err := Inspect(ctx, d.client, rawURL, headers)
+	p, err := Inspect(ctx, d.guardedClient(), rawURL, headers)
 	if err != nil {
-		return err
+		if ctx.Err() != nil || errors.Is(err, errLocalNetwork) {
+			return err
+		}
+		return nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.cookies = p.Cookies
+	// A probe that sets no cookie leaves the saved ones in place.
+	if len(p.Cookies) > 0 {
+		d.cookies = p.Cookies
+	}
 	if p.FinalURL != "" {
 		d.FinalURL = p.FinalURL
 	}
@@ -615,10 +638,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	etag, modified := d.ETag, d.LastModified
 	total := d.Total
 	d.mu.Unlock()
-	validator := etag
-	if validator == "" {
-		validator = modified
-	}
+	validator, isETag := ifRangeValidator(etag, modified)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, finalURL, nil)
 	if err != nil {
@@ -655,13 +675,18 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	defer resp.Body.Close()
 
 	if rangeOK {
-		// If-Range failed: the server is sending the whole new representation.
-		// Do not write those bytes into the old range. A 200 for a range that
-		// already covers the whole file is the same representation when the
-		// validator still matches, so that body is kept.
+		// A 200 to a request with If-Range is either a changed file (the
+		// validator no longer matches, so the server sends the new one
+		// whole) or a server that ignores Range. The 200's own validator
+		// tells them apart: a different one restarts the download, the same
+		// one is the old file, kept when the range already covered all of
+		// it and otherwise reported as an ignored Range, as without If-Range.
 		if resp.StatusCode == http.StatusOK && validator != "" {
-			if !wholeFileOK(start, end, total, etag, modified, resp) {
+			if !sameValidator(validator, isETag, resp) {
 				return errRepresentationChanged
+			}
+			if !wholeFileOK(start, end, total, resp) {
+				return fmt.Errorf("server ignored Range (status %s)", resp.Status)
 			}
 		} else if resp.StatusCode != http.StatusPartialContent {
 			return fmt.Errorf("server ignored Range (status %s)", resp.Status)
@@ -854,26 +879,36 @@ var errRepresentationChanged = errors.New("file on the server changed")
 // wholeFileOK reports whether a 200 response is the file this request already
 // asked for in full. Some servers answer 200, not 206, when the range covers
 // every byte and the validator still matches.
-func wholeFileOK(start, end, total int64, etag, modified string, resp *http.Response) bool {
+func wholeFileOK(start, end, total int64, resp *http.Response) bool {
 	if total <= 0 || start != 0 || end != total-1 {
-		return false
-	}
-	switch {
-	case etag != "":
-		if resp.Header.Get("ETag") != etag {
-			return false
-		}
-	case modified != "":
-		if resp.Header.Get("Last-Modified") != modified {
-			return false
-		}
-	default:
 		return false
 	}
 	if n := resp.ContentLength; n >= 0 && n != total {
 		return false
 	}
 	return true
+}
+
+// ifRangeValidator is what a ranged request sends as If-Range, and whether
+// it is an ETag: the ETag when it is strong, else Last-Modified, else
+// nothing. A weak ETag ("W/") is not allowed there (RFC 9110, 13.1.5), and
+// servers such as Go's own http.ServeContent answer it with a full 200:
+// every ranged request of a fresh download would look like a changed file.
+func ifRangeValidator(etag, modified string) (string, bool) {
+	if etag != "" && !strings.HasPrefix(etag, "W/") {
+		return etag, true
+	}
+	return modified, false
+}
+
+// sameValidator reports whether resp carries the validator that was sent
+// as If-Range. A 200 without it cannot show the file is the same, so it
+// counts as changed.
+func sameValidator(validator string, isETag bool, resp *http.Response) bool {
+	if isETag {
+		return resp.Header.Get("ETag") == validator
+	}
+	return resp.Header.Get("Last-Modified") == validator
 }
 
 func (d *Download) noteChanged() {

@@ -6,12 +6,12 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
-
 ### Added
 
-- Resumed downloads send the saved `ETag` or `Last-Modified` as `If-Range`.
-  When the file on the server has changed, the partial file is discarded and
-  the download starts again from the first byte. A `200` response whose range
+- Range requests send the file's `ETag` (only a strong one) or
+  `Last-Modified` as `If-Range`, and a resume checks them first. When the
+  file on the server has changed, the partial file is discarded and the
+  download starts again from the first byte. A `200` response whose range
   already covers the whole file is kept when that validator still matches.
 
 ## [0.4.3] - 2026-10-19

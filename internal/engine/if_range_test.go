@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRepresentationDiffers(t *testing.T) {
@@ -168,35 +169,181 @@ func TestIfRangeFailureRestartsMidTransfer(t *testing.T) {
 }
 
 func TestWholeFileOK(t *testing.T) {
-	header := make(http.Header)
-	header.Set("ETag", `"a"`)
-	resp := &http.Response{Header: header, ContentLength: 100}
-	if !wholeFileOK(0, 99, 100, `"a"`, "", resp) {
-		t.Fatal("matching etag on a full-file 200 was rejected")
+	resp := &http.Response{Header: make(http.Header), ContentLength: 100}
+	if !wholeFileOK(0, 99, 100, resp) {
+		t.Fatal("a full-file 200 was rejected")
 	}
-	if wholeFileOK(10, 99, 100, `"a"`, "", resp) {
+	if wholeFileOK(10, 99, 100, resp) {
 		t.Fatal("a 200 for a subrange was accepted")
 	}
-	header.Set("ETag", `"b"`)
-	if wholeFileOK(0, 99, 100, `"a"`, "", resp) {
-		t.Fatal("a different etag was accepted")
-	}
-	header.Set("ETag", `"a"`)
 	resp.ContentLength = 90
-	if wholeFileOK(0, 99, 100, `"a"`, "", resp) {
+	if wholeFileOK(0, 99, 100, resp) {
 		t.Fatal("a different length was accepted")
 	}
 	resp.ContentLength = -1
-	if !wholeFileOK(0, 99, 100, `"a"`, "", resp) {
-		t.Fatal("unknown length with a matching etag was rejected")
+	if !wholeFileOK(0, 99, 100, resp) {
+		t.Fatal("unknown length was rejected")
 	}
-	header.Del("ETag")
-	header.Set("Last-Modified", "Mon, 1 Jan 2024 00:00:00 GMT")
-	if !wholeFileOK(0, 99, 100, "", "Mon, 1 Jan 2024 00:00:00 GMT", resp) {
-		t.Fatal("matching modification time was rejected")
+}
+
+func TestIfRangeValidator(t *testing.T) {
+	const date = "Mon, 01 Jan 2024 00:00:00 GMT"
+	for _, c := range []struct {
+		etag, modified, want string
+		isETag               bool
+	}{
+		{`"a"`, date, `"a"`, true},
+		{`W/"a"`, date, date, false}, // weak: never sent as If-Range
+		{`W/"a"`, "", "", false},
+		{"", date, date, false},
+		{"", "", "", false},
+	} {
+		got, isETag := ifRangeValidator(c.etag, c.modified)
+		if got != c.want || isETag != c.isETag {
+			t.Errorf("ifRangeValidator(%q, %q) = %q, %v; want %q, %v", c.etag, c.modified, got, isETag, c.want, c.isETag)
+		}
 	}
-	if wholeFileOK(0, 99, 100, "", "Tue, 2 Jan 2024 00:00:00 GMT", resp) {
-		t.Fatal("a different modification time was accepted")
+}
+
+func TestSameValidator(t *testing.T) {
+	const date = "Mon, 01 Jan 2024 00:00:00 GMT"
+	h := make(http.Header)
+	h.Set("ETag", `"a"`)
+	h.Set("Last-Modified", date)
+	resp := &http.Response{Header: h}
+	if !sameValidator(`"a"`, true, resp) || sameValidator(`"b"`, true, resp) {
+		t.Fatal("ETag comparison")
+	}
+	if !sameValidator(date, false, resp) || sameValidator("Tue, 02 Jan 2024 00:00:00 GMT", false, resp) {
+		t.Fatal("Last-Modified comparison")
+	}
+	// An unquoted (non-standard) ETag is still compared as an ETag.
+	h.Set("ETag", "abc")
+	if !sameValidator("abc", true, resp) {
+		t.Fatal("unquoted ETag")
+	}
+	h.Del("ETag")
+	if sameValidator(`"a"`, true, resp) {
+		t.Fatal("a 200 without the ETag counted as the same file")
+	}
+}
+
+// A weak ETag must not go into If-Range: Go's http.ServeContent (like
+// RFC 9110) answers it with a full 200, which made every sub-range of a
+// fresh multi-connection download look like a changed file.
+func TestWeakETagFreshMultiConnection(t *testing.T) {
+	data := payload(512 * 1024)
+	var ifRange atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-Range") != "" {
+			ifRange.Add(1)
+		}
+		w.Header().Set("ETag", `W/"weak"`)
+		http.ServeContent(w, r, "weak.bin", time.Time{}, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	d := New("weak", srv.URL+"/weak.bin", dir, 4, nil, 0, srv.Client())
+	t.Cleanup(func() { closeEngineFile(d) })
+	d.Start(context.Background())
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if n := ifRange.Load(); n != 0 {
+		t.Fatalf("%d requests sent If-Range with a weak ETag and no Last-Modified", n)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match the source")
+	}
+}
+
+// With a weak ETag and a Last-Modified, the date goes into If-Range, and
+// http.ServeContent honours it with 206s.
+func TestWeakETagFallsBackToLastModified(t *testing.T) {
+	data := payload(512 * 1024)
+	mod := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	var sent atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v := r.Header.Get("If-Range"); v != "" {
+			sent.Store(v)
+		}
+		w.Header().Set("ETag", `W/"weak"`)
+		http.ServeContent(w, r, "weak.bin", mod, bytes.NewReader(data))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	d := New("weak-date", srv.URL+"/weak.bin", dir, 4, nil, 0, srv.Client())
+	t.Cleanup(func() { closeEngineFile(d) })
+	d.Start(context.Background())
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if v, _ := sent.Load().(string); v != mod.Format(http.TimeFormat) {
+		t.Fatalf("If-Range = %q, want the Last-Modified date", v)
+	}
+}
+
+// A resume checks the file at the address the transfer uses, with the
+// cookies the first probe got: a token link that only works there (and
+// a server that wants its cookie) resumes as it did before.
+func TestResumeRevalidatesFinalURLWithCookies(t *testing.T) {
+	data := payload(128 * 1024)
+	const etag = `"same"`
+	var original atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			original.Add(1)
+			http.Error(w, "token expired", http.StatusGone)
+			return
+		}
+		if c, err := r.Cookie("session"); err != nil || c.Value != "s1" {
+			http.Error(w, "no session", http.StatusForbidden)
+			return
+		}
+		writeRanged(w, r, data, etag, "")
+	}))
+	defer srv.Close()
+
+	const half = 64 * 1024
+	dir := t.TempDir()
+	partial := make([]byte, len(data))
+	copy(partial, data[:half])
+	if err := os.WriteFile(filepath.Join(dir, "tok.bin.odmpart"), partial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := Restore(State{
+		ID: "tok", URL: srv.URL + "/start", FinalURL: srv.URL + "/file?token=1",
+		FileName: "tok.bin", Dir: dir, Connections: 1, Total: int64(len(data)), RangeOK: true,
+		ETag: etag, Status: StatusPaused,
+		Chunks: []*Chunk{{ID: 0, Start: 0, End: int64(len(data)) - 1, Done: half}},
+	}, srv.Client())
+	d.cookies = []*http.Cookie{{Name: "session", Value: "s1"}}
+	t.Cleanup(func() { closeEngineFile(d) })
+	d.Start(context.Background())
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if n := original.Load(); n != 0 {
+		t.Fatalf("the original address was probed %d times on resume", n)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match the source")
 	}
 }
 
@@ -221,7 +368,7 @@ func TestFullFileOKWithSameETagCompletes(t *testing.T) {
 
 	dir := t.TempDir()
 	d := New("full-ok", srv.URL+"/file.bin", dir, 1, nil, 0, srv.Client())
-	t.Cleanup(func() { closeDownloadFile(d) })
+	t.Cleanup(func() { closeEngineFile(d) })
 	d.Start(context.Background())
 
 	info := d.Info()
@@ -240,6 +387,9 @@ func TestFullFileOKWithSameETagCompletes(t *testing.T) {
 	}
 }
 
+// A 200 that carries the same ETag is the old file from a server that
+// ignored Range: reported as such, not as a changed file, and nothing is
+// written over the bytes already stored.
 func TestSubrangeOKWithSameETagDoesNotWrite(t *testing.T) {
 	data := payload(128 * 1024)
 	const etag = `"same"`
@@ -272,15 +422,16 @@ func TestSubrangeOKWithSameETagDoesNotWrite(t *testing.T) {
 		},
 	}
 	d := Restore(st, srv.Client())
-	t.Cleanup(func() { closeDownloadFile(d) })
+	d.retryBase = time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
 	d.Start(context.Background())
 
 	info := d.Info()
 	if info.Status != StatusError {
 		t.Fatalf("status=%s err=%q", info.Status, info.Error)
 	}
-	if info.Error != errRepresentationChanged.Error() {
-		t.Fatalf("error=%q", info.Error)
+	if !strings.HasPrefix(info.Error, "server ignored Range") {
+		t.Fatalf("error=%q, want server ignored Range", info.Error)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "part.bin")); !os.IsNotExist(err) {
 		t.Fatal("partial file was renamed after a subrange 200")
@@ -292,15 +443,6 @@ func TestSubrangeOKWithSameETagDoesNotWrite(t *testing.T) {
 	if !bytes.Equal(got[:half], data[:half]) {
 		t.Fatal("bytes already stored were overwritten")
 	}
-}
-
-func closeDownloadFile(d *Download) {
-	d.mu.Lock()
-	if d.file != nil {
-		_ = d.file.Close()
-		d.file = nil
-	}
-	d.mu.Unlock()
 }
 
 func writeRanged(w http.ResponseWriter, r *http.Request, data []byte, etag, modified string) {
