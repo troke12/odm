@@ -564,3 +564,91 @@ func TestResumeFromPersistedState(t *testing.T) {
 		t.Fatal("resumed file does not match the source")
 	}
 }
+
+// A connection that sends some bytes and then stalls, again and again,
+// makes progress every time: it must not be given up on after MaxRetries
+// stalls. Every response here brings 4 KiB and then goes quiet.
+func TestStallsWithProgressDoNotRunOut(t *testing.T) {
+	const piece = 4096
+	data := bytes.Repeat([]byte("p"), (MaxRetries+4)*piece)
+	var transfers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, explicit := testRange(r, len(data))
+		if !explicit {
+			writeTestRange(w, data, start, end)
+			return
+		}
+		transfers.Add(1)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		n := min(piece, end-start+1)
+		_, _ = w.Write(data[start : start+n])
+		w.(http.Flusher).Flush()
+		if start+n <= end {
+			<-r.Context().Done() // stall
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	d := New("progress", srv.URL+"/p.bin", dir, 1, nil, 0, srv.Client())
+	d.stallTimeout = 50 * time.Millisecond
+	d.retryBase = time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q transfers=%d", info.Status, info.Error, transfers.Load())
+	}
+	if n := transfers.Load(); n <= MaxRetries {
+		t.Fatalf("transfers=%d: the test needs more stalls than MaxRetries to mean anything", n)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match")
+	}
+}
+
+// Stalls that bring no bytes still run out after MaxRetries.
+func TestStallsWithoutProgressRunOut(t *testing.T) {
+	data := bytes.Repeat([]byte("q"), 64*1024)
+	var transfers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, explicit := testRange(r, len(data))
+		if !explicit {
+			writeTestRange(w, data, start, end)
+			return
+		}
+		transfers.Add(1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	d := New("noprogress", srv.URL+"/q.bin", t.TempDir(), 1, nil, 0, srv.Client())
+	d.stallTimeout = 30 * time.Millisecond
+	d.retryBase = time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusError {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if n := transfers.Load(); n != MaxRetries {
+		t.Fatalf("transfers=%d, want %d", n, MaxRetries)
+	}
+}

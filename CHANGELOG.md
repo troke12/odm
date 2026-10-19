@@ -28,6 +28,9 @@ All notable changes to ODM are documented here. The format is based on
 - The size probe has the same 5-minute limit on the wait for response
   headers as a transfer. A server that accepted the request and never
   answered held the download at the start until it was paused.
+- A connection that keeps bringing some bytes between stalls is no longer
+  given up on after the retry limit: an attempt that stored bytes does not
+  count against it. Attempts with no progress still run out.
 
 ### Changed
 

@@ -697,6 +697,9 @@ func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		d.mu.Lock()
+		before := ch.Done
+		d.mu.Unlock()
 		err = d.fetch(ctx, ch)
 		if err == nil || errors.Is(err, errIgnoredRange) {
 			return err
@@ -710,12 +713,24 @@ func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 		if errors.Is(err, errLocalNetwork) {
 			return err // the same refusal on every try
 		}
+		// An attempt that stored bytes before it failed (a stall or a cut
+		// after some data) was not a wasted one: the count and the pause
+		// start over, so a connection that keeps making progress between
+		// stalls is not given up on after MaxRetries of them. Attempts with
+		// no progress still run out.
+		d.mu.Lock()
+		progressed := ch.Done > before
+		d.mu.Unlock()
+		if progressed {
+			attempt = -1 // the loop's attempt++ makes it 0
+			backoff = d.retryDelay()
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(backoff):
 		}
-		if backoff < 8*time.Second {
+		if !progressed && backoff < 8*time.Second {
 			backoff *= 2
 		}
 	}
