@@ -25,6 +25,9 @@ All notable changes to ODM are documented here. The format is based on
   answers 200 for a range covering the whole file is still segmented when
   that one-byte request returns 206; a file it serves as one chunk (one
   connection, or too small to split) takes that 200 as the whole file.
+- The size probe has the same 5-minute limit on the wait for response
+  headers as a transfer. A server that accepted the request and never
+  answered held the download at the start until it was paused.
 
 ### Changed
 

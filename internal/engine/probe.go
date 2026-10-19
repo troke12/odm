@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Probe captures what a target advertises before the transfer starts.
@@ -27,6 +28,18 @@ type Probe struct {
 // Inspect issues a ranged GET for the first byte to learn the size, whether
 // the server honours Range requests, the suggested file name and cookies.
 func Inspect(ctx context.Context, client *http.Client, rawURL string, headers map[string]string) (*Probe, error) {
+	return inspectWithin(ctx, client, rawURL, headers, DefaultHeaderTimeout)
+}
+
+// inspectWithin is Inspect with a limit on the wait for response headers,
+// the same limit a transfer has (see exchange). Without it a server that
+// accepts the connection and never answers held the download at the probe
+// until it was paused. Inspect only reads headers, so the limit can cover
+// the whole request.
+func inspectWithin(ctx context.Context, client *http.Client, rawURL string, headers map[string]string, wait time.Duration) (*Probe, error) {
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -39,6 +52,9 @@ func Inspect(ctx context.Context, client *http.Client, rawURL string, headers ma
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if parent.Err() == nil && ctx.Err() != nil {
+			return nil, fmt.Errorf("%w: no response from the server within %s", errStalled, wait)
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()

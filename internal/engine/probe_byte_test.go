@@ -161,3 +161,73 @@ func TestProbeFirstByteSingleChunk(t *testing.T) {
 		})
 	}
 }
+
+// A server that accepts the probe and never answers used to hold the
+// download at the probe until it was paused. The probe now has the same
+// header limit as a transfer.
+func TestProbeHeaderTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	d := New("hang", srv.URL+"/h.bin", t.TempDir(), 4, nil, 0, srv.Client())
+	d.headerTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusError {
+		t.Fatalf("status=%s err=%q: the probe was not bounded", info.Status, info.Error)
+	}
+	if !strings.Contains(info.Error, "no response from the server") {
+		t.Fatalf("error=%q", info.Error)
+	}
+}
+
+// On resume the probe only checks the file; when it hangs, the resume goes
+// on as before the check existed (If-Range still guards every request).
+func TestResumeProbeHangDoesNotBlock(t *testing.T) {
+	data := bytes.Repeat([]byte("r"), 128*1024)
+	const half = 64 * 1024
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isProbe(r) {
+			<-r.Context().Done()
+			return
+		}
+		writeRanged(w, r, data, `"e"`, "")
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	partial := make([]byte, len(data))
+	copy(partial, data[:half])
+	if err := os.WriteFile(filepath.Join(dir, "r.bin.odmpart"), partial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := Restore(State{
+		ID: "r", URL: srv.URL + "/r.bin", FinalURL: srv.URL + "/r.bin",
+		FileName: "r.bin", Dir: dir, Connections: 1, Total: int64(len(data)), RangeOK: true,
+		ETag: `"e"`, Status: StatusPaused,
+		Chunks: []*Chunk{{ID: 0, Start: 0, End: int64(len(data)) - 1, Done: half}},
+	}, srv.Client())
+	d.headerTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match")
+	}
+}

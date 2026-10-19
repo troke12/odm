@@ -406,7 +406,7 @@ func (d *Download) prepare(ctx context.Context) error {
 	d.mu.Unlock()
 
 	if needProbe {
-		p, err := Inspect(ctx, d.guardedClient(), rawURL, headers)
+		p, err := inspectWithin(ctx, d.guardedClient(), rawURL, headers, d.headerWait())
 		if err != nil {
 			return err
 		}
@@ -465,7 +465,7 @@ func (d *Download) revalidate(ctx context.Context) error {
 	etag, modified, total, ranged := d.ETag, d.LastModified, d.Total, d.RangeOK
 	d.mu.Unlock()
 
-	p, err := Inspect(ctx, d.guardedClient(), rawURL, headers)
+	p, err := inspectWithin(ctx, d.guardedClient(), rawURL, headers, d.headerWait())
 	if err != nil {
 		if ctx.Err() != nil || errors.Is(err, errLocalNetwork) {
 			return err
