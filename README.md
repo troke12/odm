@@ -17,9 +17,9 @@ queues. It runs as a desktop app, or headless with a JSON API.
 - Resume after a pause, crash or restart from the exact byte offset. If a
   link expires, give the download a new address and it continues where it
   stopped, as long as the new address serves the same file.
-- Range requests ask for the raw bytes (`Accept-Encoding: identity`), so a
-  compressed response is not written in place of the file. A header set on
-  the download itself is left as it is.
+- Range requests ask for the raw bytes (`Accept-Encoding: identity`, also
+  over an `Accept-Encoding` set on the download), so a server that
+  compresses unasked does not get its compressed bytes written into the file.
 - Servers that do not support ranges are fetched on a single stream.
 - Global and per-download speed limits, plus an optional data cap per time
   window.

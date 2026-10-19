@@ -13,9 +13,10 @@ All notable changes to ODM are documented here. The format is based on
   `conhost.exe` processes behind (#14). A failed settings fetch is now
   retried after 30 seconds, requests arriving together share one fetch,
   and a page past its peek budget no longer asks at all.
-- Range requests send `Accept-Encoding: identity`, so the bytes written to
-  disk are the file itself. An `Accept-Encoding` header set on the download
-  is left as it is.
+- Range requests send `Accept-Encoding: identity`, also over an
+  `Accept-Encoding` set on the download, so a server that compresses
+  without being asked cannot have compressed bytes written into the file.
+  Go already left out gzip on range requests; this covers the server side.
 
 ## [0.4.2] - 2026-10-16
 

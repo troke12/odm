@@ -35,27 +35,30 @@ func TestRangeRequestSendsIdentity(t *testing.T) {
 	}
 }
 
-func TestRangeKeepsExplicitEncoding(t *testing.T) {
+// An Accept-Encoding set on the download asks for exactly the compressed
+// bytes that cannot be written at a chunk's offset, so ranged transfers
+// replace it.
+func TestRangeOverridesExplicitEncoding(t *testing.T) {
 	data := []byte("explicit-encoding-bytes")
 	var mu sync.Mutex
 	var encodings []string
 	srv := encodingServer(t, data, true, &mu, &encodings)
 	defer srv.Close()
 
-	d := New("keep", srv.URL+"/file.bin", t.TempDir(), 1, map[string]string{"Accept-Encoding": "gzip"}, 0, srv.Client())
+	d := New("override", srv.URL+"/file.bin", t.TempDir(), 1, map[string]string{"Accept-Encoding": "gzip"}, 0, srv.Client())
 	d.Start(context.Background())
 	if d.Info().Status != StatusComplete {
 		t.Fatalf("status=%s err=%q", d.Info().Status, d.Info().Error)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(encodings) == 0 {
-		t.Fatal("no requests")
+	if len(encodings) < 2 {
+		t.Fatalf("requests = %d, want the probe and the transfer", len(encodings))
 	}
-	for _, got := range encodings {
-		if got != "gzip" {
-			t.Fatalf("Accept-Encoding = %q, want gzip", got)
-		}
+	// The probe (first request) only reads the headers; the transfer
+	// writes the body.
+	if got := encodings[len(encodings)-1]; got != "identity" {
+		t.Fatalf("transfer Accept-Encoding = %q, want identity", got)
 	}
 }
 
