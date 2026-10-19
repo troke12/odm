@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -88,9 +89,10 @@ type Download struct {
 	guarded, guardedFrom *http.Client
 	guardedFor           string
 
-	// stallTimeout overrides DefaultStallTimeout when set. Tests use a
-	// short value; a zero value means the default.
-	stallTimeout time.Duration
+	// stallTimeout and headerTimeout override DefaultStallTimeout and
+	// DefaultHeaderTimeout when set. Tests use short values; a zero value
+	// means the default.
+	stallTimeout, headerTimeout time.Duration
 }
 
 // New creates a queued download. Probing happens on the first Start.
@@ -504,13 +506,18 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		return fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
+	idle := newIdleCloser(resp.Body, d.readStall())
+	defer idle.stop()
 	buf := make([]byte, 64*1024)
 	pos := start
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		n, rerr := readWithIdle(ctx, resp.Body, buf, d.readStall())
+		n, rerr := idle.read(resp.Body, buf)
+		if rerr != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if n > 0 {
 			d.mu.Lock()
 			limit := ch.End
@@ -545,18 +552,20 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	return nil
 }
 
-// errStalled means a connection produced no bytes within the idle limit,
-// while waiting for response headers or while reading the body. The chunk
-// is retried from the last byte written. A pause is not a stall: the caller
-// returns the context error before counting a retry.
+// errStalled means a connection produced no bytes within the idle limit
+// while reading the body, or no response headers within the header limit.
+// The chunk is retried from the last byte written. A pause is not a stall:
+// the caller returns the context error before counting a retry.
 var errStalled = errors.New("connection stalled")
 
-// exchange sends req and returns when the response headers arrive. The stall
-// limit bounds that wait, then it is stopped so a long body is not cut short.
-// Pausing cancels ctx and is reported as ctx.Err().
+// exchange sends req and returns when the response headers arrive. The
+// header limit bounds that wait, then it is stopped so a long body is not
+// cut short. It is longer than the stall limit: some servers build the file
+// (an archive, an export) before they answer at all. Pausing cancels ctx
+// and is reported as ctx.Err().
 func (d *Download) exchange(ctx context.Context, req *http.Request) (*http.Response, error) {
 	headerCtx, cancel := context.WithCancel(ctx)
-	timer := time.AfterFunc(d.readStall(), cancel)
+	timer := time.AfterFunc(d.headerWait(), cancel)
 	resp, err := d.guardedClient().Do(req.WithContext(headerCtx))
 	if timer.Stop() {
 		if err != nil {
@@ -600,31 +609,48 @@ func (d *Download) readStall() time.Duration {
 	return DefaultStallTimeout
 }
 
-// readWithIdle returns the next read, or errStalled when idle elapses with
-// no bytes. Closing the body unblocks a Read left behind in that case.
-func readWithIdle(ctx context.Context, body io.ReadCloser, buf []byte, idle time.Duration) (int, error) {
-	type result struct {
-		n   int
-		err error
+func (d *Download) headerWait() time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.headerTimeout > 0 {
+		return d.headerTimeout
 	}
-	done := make(chan result, 1)
-	go func() {
-		n, err := body.Read(buf)
-		done <- result{n, err}
-	}()
-	timer := time.NewTimer(idle)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		_ = body.Close()
-		return 0, ctx.Err()
-	case <-timer.C:
-		_ = body.Close()
-		return 0, errStalled
-	case res := <-done:
-		return res.n, res.err
-	}
+	return DefaultHeaderTimeout
 }
+
+// idleCloser closes a body that goes idle too long within one Read. One
+// timer per connection, armed only around Read: a goroutine and timer per
+// 64 KiB read would sit on the hottest path, and time spent in the speed
+// limiter between reads is not the server's stall.
+type idleCloser struct {
+	idle    time.Duration
+	timer   *time.Timer
+	stalled atomic.Bool
+}
+
+func newIdleCloser(body io.Closer, idle time.Duration) *idleCloser {
+	c := &idleCloser{idle: idle}
+	c.timer = time.AfterFunc(idle, func() {
+		c.stalled.Store(true)
+		_ = body.Close()
+	})
+	c.timer.Stop()
+	return c
+}
+
+// read reads once from body, or returns errStalled when the timer closed
+// the body because no bytes came in time. A Read cut short that way ends
+// in an error from the closed body, reported as the stall instead.
+func (c *idleCloser) read(body io.Reader, buf []byte) (int, error) {
+	c.timer.Reset(c.idle)
+	n, err := body.Read(buf)
+	if !c.timer.Stop() && c.stalled.Load() {
+		return 0, errStalled
+	}
+	return n, err
+}
+
+func (c *idleCloser) stop() { c.timer.Stop() }
 
 func (d *Download) finish() error {
 	d.mu.Lock()

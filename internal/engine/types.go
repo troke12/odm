@@ -26,7 +26,12 @@ const (
 	// closed and its chunk is retried. The other connections of the same
 	// file keep transferring.
 	DefaultStallTimeout = 30 * time.Second
-	DefaultUserAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ODM/0.1"
+	// DefaultHeaderTimeout bounds the wait for a response's headers. It is
+	// much longer than DefaultStallTimeout: a server that builds the file
+	// before answering (an on-the-fly archive or export) sends nothing
+	// until it is done.
+	DefaultHeaderTimeout = 5 * time.Minute
+	DefaultUserAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ODM/0.1"
 )
 
 // Chunk is one contiguous, inclusive byte range of the target file.

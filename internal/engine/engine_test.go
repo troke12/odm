@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -131,6 +132,8 @@ func TestStalledConnectionRetriesFromLastByte(t *testing.T) {
 		data[i] = byte(i * 17)
 	}
 	var transfers atomic.Int32
+	var mu sync.Mutex
+	var ranges []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Accept-Ranges", "bytes")
 		spec := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
@@ -158,6 +161,9 @@ func TestStalledConnectionRetriesFromLastByte(t *testing.T) {
 		if !explicit {
 			return
 		}
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
 		if transfers.Add(1) == 1 {
 			const first = 4096
 			if _, err := w.Write(data[start : start+first]); err != nil {
@@ -184,6 +190,14 @@ func TestStalledConnectionRetriesFromLastByte(t *testing.T) {
 	}
 	if transfers.Load() < 2 {
 		t.Fatalf("stalled connection was not retried, transfers=%d", transfers.Load())
+	}
+	// The retry continues after the 4096 bytes already written, rather
+	// than starting the chunk over.
+	mu.Lock()
+	retry := ranges[1]
+	mu.Unlock()
+	if want := fmt.Sprintf("bytes=4096-%d", len(data)-1); retry != want {
+		t.Fatalf("retry Range = %q, want %q", retry, want)
 	}
 	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
 	if err != nil {
@@ -213,7 +227,7 @@ func TestHeaderStallRetries(t *testing.T) {
 
 	dir := t.TempDir()
 	d := New("header-stall", srv.URL+"/h.bin", dir, 1, nil, 0, srv.Client())
-	d.stallTimeout = 200 * time.Millisecond
+	d.headerTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { closeEngineFile(d) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -257,7 +271,7 @@ func TestPauseDuringHeaderWaitIsPaused(t *testing.T) {
 
 	dir := t.TempDir()
 	d = New("header-pause", srv.URL+"/p.bin", dir, 1, nil, 0, srv.Client())
-	d.stallTimeout = time.Second
+	d.headerTimeout = time.Second
 	t.Cleanup(func() { closeEngineFile(d) })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -266,6 +280,44 @@ func TestPauseDuringHeaderWaitIsPaused(t *testing.T) {
 	info := d.Info()
 	if info.Status != StatusPaused {
 		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+}
+
+// A server that takes longer than the stall limit to answer (building an
+// archive or an export first) is waited for up to the header limit, not
+// failed as a stalled connection.
+func TestSlowHeadersWithinHeaderLimit(t *testing.T) {
+	data := bytes.Repeat([]byte("s"), 128*1024)
+	var transfers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, explicit := testRange(r, len(data))
+		if start < 0 || end < start {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if explicit {
+			transfers.Add(1)
+			time.Sleep(400 * time.Millisecond)
+		}
+		writeTestRange(w, data, start, end)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	d := New("slow-headers", srv.URL+"/s.bin", dir, 1, nil, 0, srv.Client())
+	d.stallTimeout = 100 * time.Millisecond
+	d.headerTimeout = 2 * time.Second
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if n := transfers.Load(); n != 1 {
+		t.Fatalf("transfers=%d, want 1: a slow answer is not a stall", n)
 	}
 }
 
