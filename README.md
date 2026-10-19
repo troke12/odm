@@ -209,8 +209,10 @@ only.
    last chunk is merged into the one before it.
 3. **Transfer.** Workers write each chunk into the `.odmpart` file at its
    absolute offset. The first connection opens immediately. Another opens
-   after every connection already running has stored file bytes, up to the
-   configured limit. Each range request asks for the raw bytes. With more
+   each time file bytes arrive on any connection after the last one opened,
+   up to the configured limit, so one slow connection does not hold the
+   rest back and a server that refuses every request is not asked again on
+   more connections. Each range request asks for the raw bytes. With more
    than one connection the requests use HTTP/1.1, so each connection has its
    own socket. A worker that finishes early takes half of the chunk with the
    most time left, when that chunk will take at least twice as long as the

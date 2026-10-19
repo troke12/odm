@@ -34,8 +34,10 @@ All notable changes to ODM are documented here. The format is based on
   to finish, once that chunk is at least twice as slow as the fastest one.
   A connection that has gone quiet counts as the slowest. Until a pace is
   known, the largest remainder is used.
-- Connections open one at a time. The next connection starts after every
-  connection already open has stored file bytes, up to the configured limit.
+- Connections open one at a time. The next one starts once file bytes
+  arrive on any connection after the last one opened, up to the configured
+  limit: a server that refuses or never answers is not asked on more
+  connections, and one stalled connection does not keep the rest closed.
 
 ## [0.4.3] - 2026-10-19
 

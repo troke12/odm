@@ -124,14 +124,13 @@ type Download struct {
 	// previous plan does not write those bytes into the replacement chunk.
 	plan int
 
-	// connLimit is how many connections this run may open. connOpened is how
-	// many workers have been started. connReady is how many of those have
-	// stored file bytes. The next worker starts only once every worker
-	// already opened has stored bytes.
-	connLimit  int
-	connOpened int
-	connReady  int
-	connWg     *sync.WaitGroup
+	// rampReady is signalled (once, then rampArmed is cleared) when any
+	// connection stores file bytes after the last connection was opened;
+	// ramp opens the next one on it. nil outside a pass.
+	rampReady chan struct{}
+	rampArmed bool
+	// rampOpened counts the connections opened in the current pass.
+	rampOpened int
 }
 
 // New creates a queued download. Probing happens on the first Start.
@@ -301,19 +300,45 @@ func (d *Download) Start(parent context.Context) {
 		if workers < 1 {
 			workers = 1
 		}
+		// Connections open one at a time (ramp): the first now, each next
+		// once file bytes arrive on any of them. ramp holds a count on wg
+		// while it may still add workers, so Wait cannot return early.
 		var wg sync.WaitGroup
+		var live atomic.Int32
+		ready := make(chan struct{}, 1)
+		exited := make(chan struct{}, 1)
+		open := func() {
+			d.mu.Lock()
+			d.rampOpened++
+			d.rampArmed = true
+			d.mu.Unlock()
+			live.Add(1)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				d.worker(transferCtx)
+				live.Add(-1)
+				select {
+				case exited <- struct{}{}:
+				default:
+				}
+			}()
+		}
 		d.mu.Lock()
-		d.connLimit = workers
-		d.connOpened = 1
-		d.connReady = 0
-		d.connWg = &wg
+		d.rampReady, d.rampOpened = ready, 0
 		d.mu.Unlock()
-		wg.Add(1)
-		go func() { defer wg.Done(); d.worker(transferCtx) }()
+		open()
+		if workers > 1 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				d.ramp(transferCtx, workers-1, ready, exited, &live, open)
+			}()
+		}
 		wg.Wait()
 		transferCancel()
 		d.mu.Lock()
-		d.connWg = nil
+		d.rampReady, d.rampArmed = nil, false
 		d.transferCancel = nil
 		paused := ctx.Err() != nil
 		complete := d.allCompleteLocked()
@@ -600,7 +625,6 @@ func (d *Download) openTarget(fresh bool) error {
 }
 
 func (d *Download) worker(ctx context.Context) {
-	ready := false
 	for {
 		if ctx.Err() != nil {
 			return
@@ -612,7 +636,7 @@ func (d *Download) worker(ctx context.Context) {
 		if ch == nil {
 			return
 		}
-		err := d.fetchWithRetry(ctx, ch, &ready)
+		err := d.fetchWithRetry(ctx, ch)
 		if errors.Is(err, errRepresentationChanged) {
 			d.noteChanged()
 			d.mu.Lock()
@@ -666,14 +690,14 @@ func (d *Download) trySplit() *Chunk {
 	return nc
 }
 
-func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk, ready *bool) error {
+func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 	var err error
 	backoff := d.retryDelay()
 	for attempt := 0; attempt < MaxRetries; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		err = d.fetch(ctx, ch, ready)
+		err = d.fetch(ctx, ch)
 		if err == nil || errors.Is(err, errIgnoredRange) {
 			return err
 		}
@@ -698,7 +722,7 @@ func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk, ready *bool) e
 	return err
 }
 
-func (d *Download) fetch(ctx context.Context, ch *Chunk, ready *bool) error {
+func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	d.mu.Lock()
 	if ch.Complete() {
 		d.mu.Unlock()
@@ -826,12 +850,15 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk, ready *bool) error {
 				d.mu.Lock()
 				ch.Done += int64(n)
 				ch.notePace(int64(n), time.Now())
+				if d.rampArmed {
+					d.rampArmed = false
+					select {
+					case d.rampReady <- struct{}{}:
+					default:
+					}
+				}
 				d.mu.Unlock()
 				d.notify(false)
-				if ready != nil && !*ready {
-					*ready = true
-					d.noteReady(ctx)
-				}
 				if werr := d.limiter.Wait(ctx, n); werr != nil {
 					return werr
 				}
@@ -864,24 +891,46 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk, ready *bool) error {
 	return nil
 }
 
-// noteReady records that one open connection has stored file bytes. When
-// every connection already opened has done that, one more connection starts,
-// up to the configured limit.
-func (d *Download) noteReady(ctx context.Context) {
-	d.mu.Lock()
-	d.connReady++
-	if d.connWg == nil || d.Status == StatusError || d.connOpened >= d.connLimit || d.connReady < d.connOpened {
-		d.mu.Unlock()
-		return
+// ramp opens up to more connections, one at a time. The next opens once
+// any connection has stored file bytes since the last one opened, so one
+// slow or stalled connection does not hold the others back, and a server
+// that refuses or never answers is not asked on more connections. A worker
+// error does not stop it: the run may still complete. It ends when every
+// connection is open, the pass ends, or nothing is left to hand out.
+func (d *Download) ramp(ctx context.Context, more int, ready, exited <-chan struct{}, live *atomic.Int32, open func()) {
+	for more > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-exited:
+			if live.Load() == 0 || !d.hasWork() {
+				return
+			}
+			continue
+		case <-ready:
+		}
+		if !d.hasWork() {
+			return
+		}
+		open()
+		more--
 	}
-	d.connOpened++
-	wg := d.connWg
-	d.mu.Unlock()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		d.worker(ctx)
-	}()
+}
+
+// hasWork reports whether a new connection would find something to fetch:
+// an unclaimed chunk, or one large enough to split.
+func (d *Download) hasWork() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.Chunks {
+		if c.Complete() {
+			continue
+		}
+		if !c.claimed || (!d.alone && c.Remaining() >= 2*MinChunkSize) {
+			return true
+		}
+	}
+	return false
 }
 
 // errStalled means a connection produced no bytes within the idle limit
