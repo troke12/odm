@@ -24,9 +24,12 @@ All notable changes to ODM are documented here. The format is based on
   `Accept-Encoding` set on the download, so a server that compresses
   without being asked cannot have compressed bytes written into the file.
   Go already left out gzip on range requests; this covers the server side.
-- A connection that closes before its chunk is finished retries from the
-  last byte written. The retry uses the usual pause and stops after the
-  retry limit.
+- A server answering a range with an empty body (206, nothing in it) was
+  asked again at once, without end: thousands of requests a second. Such a
+  response now counts as a failed attempt, with the usual pause, and the
+  download stops after the retry limit. A response that ends short after
+  some bytes still continues from the last byte written, however many
+  responses the file takes.
 
 ## [0.4.2] - 2026-10-16
 

@@ -554,14 +554,18 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 			return rerr
 		}
 	}
-	if !early {
-		return nil
-	}
-	d.mu.Lock()
-	complete := ch.Complete()
-	d.mu.Unlock()
-	if !complete {
-		return errShortBody
+	// A body that ended short after some bytes is not a failure: the
+	// worker takes the chunk up again from its last byte, so a server that
+	// caps each 206 (at 1 MiB, say) still finishes a large chunk. Only a
+	// response that wrote nothing counts against MaxRetries, with the
+	// usual backoff, rather than being asked again at once forever.
+	if early && pos == start {
+		d.mu.Lock()
+		complete := ch.Complete()
+		d.mu.Unlock()
+		if !complete {
+			return errShortBody
+		}
 	}
 	return nil
 }
@@ -666,8 +670,9 @@ func (c *idleCloser) read(body io.Reader, buf []byte) (int, error) {
 
 func (c *idleCloser) stop() { c.timer.Stop() }
 
-// errShortBody means the response ended before every byte of the chunk was
-// written. The chunk is retried from the last byte written.
+// errShortBody means a response ended cleanly (io.EOF) without writing any
+// byte of the chunk. A connection cut mid-body with a Content-Length gives
+// io.ErrUnexpectedEOF instead, which was already retried.
 var errShortBody = errors.New("connection closed early")
 
 func (d *Download) retryDelay() time.Duration {
