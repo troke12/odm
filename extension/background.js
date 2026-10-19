@@ -17,6 +17,10 @@ const DEFAULT_TYPES = [
 // Smaller media responses are ads, previews or interface sounds.
 const MIN_MEDIA_BYTES = 512 * 1024;
 const CONFIG_TTL_MS = 5 * 60 * 1000;
+// How long a failed config fetch stands before ODM is asked again. Every
+// ask starts a native host process (on Windows through cmd.exe), so with
+// ODM not running, retrying on every event spawned hosts without limit.
+const CONFIG_RETRY_MS = 30 * 1000;
 const MAX_MEDIA_PER_TAB = 15;
 const BYPASS_MS = 10 * 1000;
 
@@ -43,6 +47,14 @@ function hasType(url, types, filename) {
   const set = new Set(types.map((t) => String(t).toLowerCase().replace(/^\./, "")));
   const fromName = /\.([a-z0-9]{1,8})$/i.exec(filename || "");
   return set.has(urlExt(url)) || (fromName !== null && set.has(fromName[1].toLowerCase()));
+}
+
+// configFresh reports whether a cached config may still be used: ODM's
+// answer for CONFIG_TTL_MS, the built-in fallback (ok false) for the
+// shorter CONFIG_RETRY_MS.
+function configFresh(cfg, now) {
+  if (!cfg || typeof cfg.at !== "number") return false;
+  return now - cfg.at < (cfg.ok ? CONFIG_TTL_MS : CONFIG_RETRY_MS);
 }
 
 // hostMatches: "example.org" matches that host; "*.example.org" matches it
@@ -243,15 +255,26 @@ async function isEnabled() {
   return enabled;
 }
 
+// One config fetch at a time: events arriving together all read the cache
+// before any of them writes it, and would each start a host. Kept in
+// memory only, so it is gone with the service worker, as the fetch is.
+let configPending = null;
+
 async function getConfig() {
   const { odmConfig } = await chrome.storage.session.get("odmConfig");
-  if (odmConfig && Date.now() - odmConfig.at < CONFIG_TTL_MS) return odmConfig;
-  const reply = await askOdm({ type: "config" });
-  const cfg = reply.ok && reply.config
-    ? { fileTypes: reply.config.fileTypes || DEFAULT_TYPES, excludeSites: reply.config.excludeSites || [], at: Date.now() }
-    : { fileTypes: DEFAULT_TYPES, excludeSites: [], at: 0 }; // retry next time
-  await chrome.storage.session.set({ odmConfig: cfg });
-  return cfg;
+  if (configFresh(odmConfig, Date.now())) return odmConfig;
+  if (!configPending) {
+    configPending = (async () => {
+      const reply = await askOdm({ type: "config" });
+      const ok = Boolean(reply.ok && reply.config);
+      const cfg = ok
+        ? { fileTypes: reply.config.fileTypes || DEFAULT_TYPES, excludeSites: reply.config.excludeSites || [], ok, at: Date.now() }
+        : { fileTypes: DEFAULT_TYPES, excludeSites: [], ok, at: Date.now() }; // asked again after CONFIG_RETRY_MS
+      await chrome.storage.session.set({ odmConfig: cfg });
+      return cfg;
+    })().finally(() => { configPending = null; });
+  }
+  return configPending;
 }
 
 async function cookieHeader(url) {
@@ -313,8 +336,12 @@ async function mayPeek(tabId, url) {
   } catch {
     return false;
   }
+  // The budget is checked before the config too: getConfig may start a
+  // native host, and a spent budget must not keep asking for one.
+  if ((peeks.get(tabId) || 0) >= MAX_PEEKS_PER_PAGE) return false;
   const cfg = await getConfig();
   if (isExcluded(url, cfg.excludeSites)) return false;
+  // Read again: other streams of this tab may have spent it meanwhile.
   const n = peeks.get(tabId) || 0;
   if (n >= MAX_PEEKS_PER_PAGE) return false;
   peeks.set(tabId, n + 1);
@@ -562,5 +589,5 @@ if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { hasType, hostMatches, isExcluded, mediaKind, streamFormat, normalizeMediaURL, totalSize, mergeMedia, popupReferrer, describePlaylist, sameDocument, DEFAULT_TYPES };
+  module.exports = { hasType, configFresh, getConfig, hostMatches, isExcluded, mediaKind, streamFormat, normalizeMediaURL, totalSize, mergeMedia, popupReferrer, describePlaylist, sameDocument, DEFAULT_TYPES, CONFIG_TTL_MS, CONFIG_RETRY_MS };
 }

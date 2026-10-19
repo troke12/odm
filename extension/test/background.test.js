@@ -142,3 +142,46 @@ test("sameDocument", () => {
   assert.equal(bg.sameDocument("https://s.example/a", "https://s.example/b"), false);
   assert.equal(bg.sameDocument("not a url", "not a url"), false);
 });
+
+test("configFresh keeps ODM's answer longer than the fallback", () => {
+  const now = 1_000_000;
+  assert.equal(bg.configFresh(undefined, now), false);
+  assert.equal(bg.configFresh({ at: 0 }, now), false); // the old "retry next time" entry
+  assert.equal(bg.configFresh({ ok: true, at: now - bg.CONFIG_TTL_MS + 1 }, now), true);
+  assert.equal(bg.configFresh({ ok: true, at: now - bg.CONFIG_TTL_MS }, now), false);
+  assert.equal(bg.configFresh({ ok: false, at: now - bg.CONFIG_RETRY_MS + 1 }, now), true);
+  assert.equal(bg.configFresh({ ok: false, at: now - bg.CONFIG_RETRY_MS }, now), false);
+});
+
+test("getConfig with ODM down asks once, for concurrent calls and after", async () => {
+  // A fake chrome with ODM unreachable: each sendNativeMessage is one host
+  // process the browser would start.
+  let asks = 0;
+  const store = {};
+  globalThis.chrome = {
+    runtime: {
+      lastError: undefined,
+      sendNativeMessage(_host, _msg, cb) {
+        asks++;
+        setTimeout(() => {
+          chrome.runtime.lastError = { message: "Specified native messaging host not found." };
+          cb(undefined);
+          chrome.runtime.lastError = undefined;
+        }, 5);
+      },
+    },
+    storage: { session: {
+      async get(k) { return { [k]: store[k] }; },
+      async set(o) { Object.assign(store, o); },
+    } },
+  };
+  try {
+    const got = await Promise.all(Array.from({ length: 20 }, () => bg.getConfig()));
+    assert.equal(asks, 1);
+    assert.deepEqual(got[0].fileTypes, bg.DEFAULT_TYPES);
+    await bg.getConfig();
+    assert.equal(asks, 1, "a failed fetch is cached for CONFIG_RETRY_MS");
+  } finally {
+    delete globalThis.chrome;
+  }
+});

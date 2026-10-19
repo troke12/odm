@@ -6,6 +6,14 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- With ODM not running, the browser extension started a native host for
+  every video it noticed, which on Windows left hundreds of `cmd.exe` and
+  `conhost.exe` processes behind (#14). A failed settings fetch is now
+  retried after 30 seconds, requests arriving together share one fetch,
+  and a page past its peek budget no longer asks at all.
+
 ## [0.4.2] - 2026-10-16
 
 ### Added
