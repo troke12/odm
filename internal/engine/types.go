@@ -48,6 +48,9 @@ type Chunk struct {
 	Done  int64 `json:"done"`
 
 	claimed bool
+	// retired is set when the chunk leaves the plan because one connection
+	// took the whole file (takeWholeFile); a worker still holding it stops.
+	retired bool
 	// pace is the recent bytes per second. Zero means it is not known yet,
 	// so a split falls back to the largest remainder.
 	pace      int64

@@ -739,6 +739,10 @@ func (d *Download) fetchWithRetry(ctx context.Context, ch *Chunk) error {
 
 func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	d.mu.Lock()
+	if ch.retired {
+		d.mu.Unlock()
+		return errIgnoredRange
+	}
 	if ch.Complete() {
 		d.mu.Unlock()
 		return nil
@@ -820,13 +824,27 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 				return fmt.Errorf("server ignored Range (status %s)", resp.Status)
 			}
 			if !wholeFileRange(start, end, total) {
-				if !alone {
+				switch {
+				case !alone && start == 0:
+					// This chunk asked from byte 0, so the body is already at
+					// its offset: keep it and run on to the end of the file
+					// on this connection, instead of dropping it and asking
+					// again. If another connection went alone first, this
+					// one stops like any other.
+					p, ok := d.takeWholeFile(ch)
+					if !ok {
+						return errIgnoredRange
+					}
+					plan = p
+				case !alone:
 					return errIgnoredRange
-				}
-				// This connection is already the only one. Skip the prefix
-				// that is already stored and write the rest at its offset.
-				if err := discardPrefix(ctx, idle, resp.Body, start); err != nil {
-					return err
+				default:
+					// This connection is already the only one. Skip the
+					// prefix that is already stored and write the rest at
+					// its offset.
+					if err := discardPrefix(ctx, idle, resp.Body, start); err != nil {
+						return err
+					}
 				}
 			}
 		default:
@@ -1132,6 +1150,31 @@ func (d *Download) noteIgnoredRange() {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// takeWholeFile makes ch, which starts at byte 0 and got the whole file as
+// a 200, the only chunk: it now runs to the end of the file. The other
+// chunks are retired and their connections stop at their next write (the
+// plan changes) or their next request; bytes they stored are written again
+// by this one, which is the same file (the validator matched). It reports
+// false when another connection already put the download on one
+// connection. It returns the new plan for the caller's own writes.
+func (d *Download) takeWholeFile(ch *Chunk) (int, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.alone || ch.retired || d.Total <= 0 {
+		return d.plan, false
+	}
+	d.alone = true
+	d.plan++
+	for _, c := range d.Chunks {
+		if c != ch {
+			c.retired = true
+		}
+	}
+	ch.End = d.Total - 1
+	d.Chunks = []*Chunk{ch}
+	return d.plan, true
 }
 
 // planAlone keeps the contiguous prefix and leaves one chunk for the rest.

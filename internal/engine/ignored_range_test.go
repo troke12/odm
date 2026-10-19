@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -253,25 +254,23 @@ func TestSubrangeOKFallsBackToOneConnection(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatal("file does not match")
 	}
-	whole := fmt.Sprintf("bytes=0-%d", len(data)-1)
-	var sawSubrange, sawWhole bool
+	// The first transfer asks for chunk 0, a smaller range from byte 0. Its
+	// whole-file 200 is kept and runs to the end (takeWholeFile), so no
+	// second request is needed.
 	mu.Lock()
 	defer mu.Unlock()
+	var transfers []string
 	for _, spec := range ranges {
-		if spec == whole {
-			sawWhole = true
-			continue
-		}
-		parts := strings.SplitN(strings.TrimPrefix(spec, "bytes="), "-", 2)
-		if len(parts) == 2 && parts[1] != "" {
-			sawSubrange = true
+		if spec != probeRange {
+			transfers = append(transfers, spec)
 		}
 	}
-	if !sawSubrange {
-		t.Fatal("no smaller range was requested")
+	if len(transfers) != 1 {
+		t.Fatalf("transfer requests = %v, want one", transfers)
 	}
-	if !sawWhole {
-		t.Fatalf("the remainder was not requested as %s; ranges %v", whole, ranges)
+	parts := strings.SplitN(strings.TrimPrefix(transfers[0], "bytes="), "-", 2)
+	if len(parts) != 2 || parts[0] != "0" || parts[1] == "" || parts[1] == strconv.Itoa(len(data)-1) {
+		t.Fatalf("the transfer %q was not a smaller range from byte 0", transfers[0])
 	}
 }
 
@@ -334,5 +333,81 @@ func TestDiscardPrefixStallRetries(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatal("downloaded bytes do not match the source")
+	}
+}
+
+// When the chunk that starts at byte 0 gets the whole file as a 200, that
+// body is already at the right offset: it is kept and runs to the end of
+// the file, instead of being dropped and the rest asked for again.
+func TestChunkZeroWholeFileIsKept(t *testing.T) {
+	data := make([]byte, 512*1024)
+	for i := range data {
+		data[i] = byte(i*11 + 5)
+	}
+	var transfers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isProbe(r) {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[:1])
+			return
+		}
+		transfers.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	d := New("zero", srv.URL+"/z.bin", dir, 4, nil, 0, srv.Client())
+	t.Cleanup(func() { closeEngineFile(d) })
+	d.Start(context.Background())
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	if n := transfers.Load(); n != 1 {
+		t.Fatalf("transfers=%d, want 1: the whole-file body was dropped and asked for again", n)
+	}
+	if !d.alone {
+		t.Fatal("the download did not go to one connection")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match")
+	}
+}
+
+// takeWholeFile retires the other chunks, so a worker holding one stops
+// at its next request, and refuses when the download already went alone.
+func TestTakeWholeFileRetiresTheRest(t *testing.T) {
+	d := New("t", "http://x/a", t.TempDir(), 3, nil, 0, nil)
+	d.Total = 300
+	a := &Chunk{ID: 0, Start: 0, End: 99}
+	b := &Chunk{ID: 1, Start: 100, End: 199, Done: 50}
+	c := &Chunk{ID: 2, Start: 200, End: 299}
+	d.Chunks = []*Chunk{a, b, c}
+	plan, ok := d.takeWholeFile(a)
+	if !ok || plan != 1 {
+		t.Fatalf("takeWholeFile = %d, %v", plan, ok)
+	}
+	if len(d.Chunks) != 1 || d.Chunks[0] != a || a.End != 299 {
+		t.Fatalf("plan = %+v, chunk end %d", d.Chunks, a.End)
+	}
+	if !b.retired || !c.retired || a.retired {
+		t.Fatal("the other chunks were not retired")
+	}
+	if err := d.fetch(context.Background(), b); !errors.Is(err, errIgnoredRange) {
+		t.Fatalf("fetch of a retired chunk = %v", err)
+	}
+	if _, ok := d.takeWholeFile(a); ok {
+		t.Fatal("a second takeWholeFile succeeded after the download went alone")
 	}
 }

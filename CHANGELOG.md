@@ -44,6 +44,9 @@ All notable changes to ODM are documented here. The format is based on
   arrive on any connection after the last one opened, up to the configured
   limit: a server that refuses or never answers is not asked on more
   connections, and one stalled connection does not keep the rest closed.
+- When the first chunk of a file gets the whole file as a `200`, that
+  response is kept and runs to the end of the file on one connection,
+  instead of being dropped and the rest asked for again.
 
 ## [0.4.3] - 2026-10-19
 
