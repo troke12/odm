@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -107,7 +108,10 @@ func TestIgnoredSubrangeKeepsFinishedBytes(t *testing.T) {
 			parts := strings.SplitN(strings.TrimPrefix(spec, "bytes="), "-", 2)
 			start, _ = strconv.Atoi(parts[0])
 		}
-		if start == 0 {
+		// The resume probe (bytes=0-) is answered like any request to a
+		// server that ignores Range: the whole file. A transfer asking from
+		// byte 0 would mean the stored prefix was thrown away.
+		if start == 0 && spec != "bytes=0-" {
 			http.Error(w, "restarted from byte 0", http.StatusInternalServerError)
 			return
 		}
@@ -178,6 +182,9 @@ func TestIgnoredSubrangeKeepsFinishedBytes(t *testing.T) {
 		t.Fatal("no range was requested")
 	}
 	for _, spec := range ranges {
+		if spec == "bytes=0-" {
+			continue // the resume probe
+		}
 		parts := strings.SplitN(strings.TrimPrefix(spec, "bytes="), "-", 2)
 		start, _ := strconv.Atoi(parts[0])
 		if start < gap {
@@ -267,5 +274,67 @@ func TestSubrangeOKFallsBackToOneConnection(t *testing.T) {
 	}
 	if !sawWhole {
 		t.Fatalf("the remainder was not requested as %s; ranges %v", whole, ranges)
+	}
+}
+
+// Skipping the stored prefix of a whole-file 200 reads the body too: a
+// connection that stalls there is closed and retried like any other,
+// instead of holding the download until it is paused.
+func TestDiscardPrefixStallRetries(t *testing.T) {
+	data := make([]byte, 256*1024)
+	for i := range data {
+		data[i] = byte(i*7 + 3)
+	}
+	const half = 128 * 1024
+	var transfers atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "bytes=0-" {
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			return // the resume probe only reads the headers
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		if transfers.Add(1) == 1 {
+			_, _ = w.Write(data[:1024])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done() // stalls inside the prefix
+			return
+		}
+		_, _ = w.Write(data)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	partial := make([]byte, len(data))
+	copy(partial, data[:half])
+	if err := os.WriteFile(filepath.Join(dir, "st.bin.odmpart"), partial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := Restore(State{
+		ID: "st", URL: srv.URL + "/st.bin", FinalURL: srv.URL + "/st.bin",
+		FileName: "st.bin", Dir: dir, Connections: 1, Total: int64(len(data)), RangeOK: true,
+		Alone: true, Status: StatusPaused,
+		Chunks: []*Chunk{{ID: 0, Start: 0, End: int64(len(data)) - 1, Done: half}},
+	}, srv.Client())
+	d.stallTimeout = 200 * time.Millisecond
+	d.retryBase = time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q transfers=%d", info.Status, info.Error, transfers.Load())
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match the source")
 	}
 }

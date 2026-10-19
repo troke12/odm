@@ -17,23 +17,24 @@ import (
 
 func TestRepresentationDiffers(t *testing.T) {
 	same := &Probe{ETag: `"a"`, LastModified: "Mon, 1 Jan 2024 00:00:00 GMT", Total: 100, RangeOK: true}
-	if representationDiffers(`"a"`, same.LastModified, 100, true, 10, same) {
+	if representationDiffers(`"a"`, same.LastModified, 100, same) {
 		t.Fatal("identical probe reported as a different file")
 	}
-	if representationDiffers("", "", 100, true, 10, same) {
+	if representationDiffers("", "", 100, same) {
 		t.Fatal("a download saved before validators existed must still resume")
 	}
-	if !representationDiffers(`"a"`, "", 100, true, 10, &Probe{ETag: `"b"`, Total: 100, RangeOK: true}) {
+	if !representationDiffers(`"a"`, "", 100, &Probe{ETag: `"b"`, Total: 100, RangeOK: true}) {
 		t.Fatal("etag change was ignored")
 	}
-	if !representationDiffers("", same.LastModified, 100, true, 10, &Probe{LastModified: "Tue, 2 Jan 2024 00:00:00 GMT", Total: 100, RangeOK: true}) {
+	if !representationDiffers("", same.LastModified, 100, &Probe{LastModified: "Tue, 2 Jan 2024 00:00:00 GMT", Total: 100, RangeOK: true}) {
 		t.Fatal("modification time change was ignored")
 	}
-	if !representationDiffers(`"a"`, "", 100, true, 10, &Probe{ETag: `"a"`, Total: 80, RangeOK: true}) {
+	if !representationDiffers(`"a"`, "", 100, &Probe{ETag: `"a"`, Total: 80, RangeOK: true}) {
 		t.Fatal("size change was ignored")
 	}
-	if !representationDiffers("", "", 100, true, 10, &Probe{Total: 100, RangeOK: false}) {
-		t.Fatal("losing range support with bytes on disk was ignored")
+	// Losing range support is the same file, continued on one connection.
+	if representationDiffers(`"a"`, "", 100, &Probe{ETag: `"a"`, Total: 100, RangeOK: false}) {
+		t.Fatal("losing range support alone counted as a different file")
 	}
 }
 
@@ -370,19 +371,22 @@ func TestFullFileOKWithSameETagCompletes(t *testing.T) {
 }
 
 // A 200 that carries the same ETag is the old file from a server that
-// ignored Range: reported as such, not as a changed file, and nothing is
-// written over the bytes already stored.
-func TestSubrangeOKWithSameETagDoesNotWrite(t *testing.T) {
+// ignored Range: not a changed file. The download keeps the bytes already
+// stored and continues on one connection, skipping that prefix of the body.
+func TestSubrangeOKWithSameETagContinuesAlone(t *testing.T) {
 	data := payload(128 * 1024)
 	const etag = `"same"`
 	const half = 64 * 1024
+	// The whole-file body differs from the file in its first half, so the
+	// result shows whether that prefix was skipped or written again.
+	body := append(bytes.Repeat([]byte("X"), half), data[half:]...)
 	remainder := fmt.Sprintf("bytes=%d-", half)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.Header.Get("Range"), remainder) && r.Header.Get("If-Range") == etag {
 			w.Header().Set("ETag", etag)
-			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(data)
+			_, _ = w.Write(body)
 			return
 		}
 		writeRanged(w, r, data, etag, "")
@@ -395,35 +399,82 @@ func TestSubrangeOKWithSameETagDoesNotWrite(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "part.bin.odmpart"), partial, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st := State{
+	d := Restore(State{
 		ID: "part", URL: srv.URL + "/part.bin", FinalURL: srv.URL + "/part.bin",
 		FileName: "part.bin", Dir: dir, Connections: 1, Total: int64(len(data)), RangeOK: true,
 		ETag: etag, Status: StatusPaused,
-		Chunks: []*Chunk{
-			{ID: 0, Start: 0, End: int64(len(data)) - 1, Done: half},
-		},
-	}
-	d := Restore(st, srv.Client())
+		Chunks: []*Chunk{{ID: 0, Start: 0, End: int64(len(data)) - 1, Done: half}},
+	}, srv.Client())
 	d.retryBase = time.Millisecond
 	t.Cleanup(func() { closeEngineFile(d) })
 	d.Start(context.Background())
 
 	info := d.Info()
-	if info.Status != StatusError {
+	if info.Status != StatusComplete {
 		t.Fatalf("status=%s err=%q", info.Status, info.Error)
 	}
-	if !strings.HasPrefix(info.Error, "server ignored Range") {
-		t.Fatalf("error=%q, want server ignored Range", info.Error)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "part.bin")); !os.IsNotExist(err) {
-		t.Fatal("partial file was renamed after a subrange 200")
-	}
-	got, err := os.ReadFile(filepath.Join(dir, "part.bin.odmpart"))
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got[:half], data[:half]) {
-		t.Fatal("bytes already stored were overwritten")
+	if !bytes.Equal(got, data) {
+		t.Fatal("the stored prefix was not kept, or the tail is wrong")
+	}
+}
+
+// A 200 with another ETag but the same length is a replaced file. It must
+// restart rather than take the one-connection path, which would write the
+// new file's tail after the old file's prefix.
+func TestSubrangeOKWithOtherETagSameSizeRestarts(t *testing.T) {
+	oldData := payload(128 * 1024)
+	newData := bytes.Repeat([]byte("n"), len(oldData))
+	const half = 64 * 1024
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The first request is the resume probe and still sees the old
+		// file; the file is replaced before the transfer asks.
+		if requests.Add(1) > 1 {
+			if r.Header.Get("If-Range") == `"old"` {
+				w.Header().Set("ETag", `"new"`)
+				w.Header().Set("Content-Length", strconv.Itoa(len(newData)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(newData)
+				return
+			}
+			writeRanged(w, r, newData, `"new"`, "")
+			return
+		}
+		writeRanged(w, r, oldData, `"old"`, "")
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	partial := make([]byte, len(oldData))
+	copy(partial, oldData[:half])
+	if err := os.WriteFile(filepath.Join(dir, "rep.bin.odmpart"), partial, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := Restore(State{
+		ID: "rep", URL: srv.URL + "/rep.bin", FinalURL: srv.URL + "/rep.bin",
+		FileName: "rep.bin", Dir: dir, Connections: 1, Total: int64(len(oldData)), RangeOK: true,
+		ETag: `"old"`, Status: StatusPaused,
+		Chunks: []*Chunk{{ID: 0, Start: 0, End: int64(len(oldData)) - 1, Done: half}},
+	}, srv.Client())
+	d.alone = true // the one-connection path is already active
+	d.retryBase = time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
+	d.Start(context.Background())
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q", info.Status, info.Error)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newData) {
+		t.Fatal("a replaced file of the same size was stitched onto the old prefix")
 	}
 }
 

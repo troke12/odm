@@ -412,7 +412,6 @@ func (d *Download) revalidate(ctx context.Context) error {
 		headers["Cookie"] = cookieHeader(d.cookies)
 	}
 	etag, modified, total, ranged := d.ETag, d.LastModified, d.Total, d.RangeOK
-	done := d.doneLocked()
 	d.mu.Unlock()
 
 	p, err := Inspect(ctx, d.guardedClient(), rawURL, headers)
@@ -431,12 +430,21 @@ func (d *Download) revalidate(ctx context.Context) error {
 	if p.FinalURL != "" {
 		d.FinalURL = p.FinalURL
 	}
-	if !representationDiffers(etag, modified, total, ranged, done, p) {
+	if !representationDiffers(etag, modified, total, p) {
 		if p.ETag != "" {
 			d.ETag = p.ETag
 		}
 		if p.LastModified != "" {
 			d.LastModified = p.LastModified
+		}
+		// The same file from a server that now answers ranges with the
+		// whole file: the bytes on disk are still good, so the download
+		// keeps its prefix and continues on one connection, as when a
+		// transfer notices it (noteIgnoredRange).
+		if ranged && !p.RangeOK && !d.alone {
+			d.alone = true
+			d.plan++
+			d.planAloneLocked()
 		}
 		return nil
 	}
@@ -464,9 +472,10 @@ func (d *Download) planLocked(p *Probe) {
 
 // representationDiffers reports whether p is a different file from the one
 // already partly stored. A missing saved validator does not count, so state
-// written before validators were kept still resumes. A different size, or a
-// ranged download whose server no longer accepts ranges, does.
-func representationDiffers(etag, modified string, total int64, ranged bool, done int64, p *Probe) bool {
+// written before validators were kept still resumes. A different size does.
+// A server that no longer accepts ranges does not by itself: that is the
+// same file, continued on one connection (see revalidate).
+func representationDiffers(etag, modified string, total int64, p *Probe) bool {
 	if total > 0 && p.Total > 0 && total != p.Total {
 		return true
 	}
@@ -474,9 +483,6 @@ func representationDiffers(etag, modified string, total int64, ranged bool, done
 		return true
 	}
 	if modified != "" && p.LastModified != "" && modified != p.LastModified {
-		return true
-	}
-	if ranged && !p.RangeOK && done > 0 {
 		return true
 	}
 	return false
@@ -716,6 +722,10 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 		return err
 	}
 	defer resp.Body.Close()
+	// Created before the status checks: skipping a stored prefix reads the
+	// body too, and a connection that stalls there is retried like any other.
+	idle := newIdleCloser(resp.Body, d.readStall())
+	defer idle.stop()
 
 	if rangeOK {
 		switch resp.StatusCode {
@@ -743,7 +753,7 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 				}
 				// This connection is already the only one. Skip the prefix
 				// that is already stored and write the rest at its offset.
-				if err := discardPrefix(ctx, resp.Body, start); err != nil {
+				if err := discardPrefix(ctx, idle, resp.Body, start); err != nil {
 					return err
 				}
 			}
@@ -753,9 +763,6 @@ func (d *Download) fetch(ctx context.Context, ch *Chunk) error {
 	} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("unexpected status: %s", resp.Status)
 	}
-
-	idle := newIdleCloser(resp.Body, d.readStall())
-	defer idle.stop()
 	buf := make([]byte, 64*1024)
 	pos := start
 	early := false
@@ -955,8 +962,9 @@ func wholeFileRange(start, end, total int64) bool {
 }
 
 // discardPrefix reads n bytes and drops them. A 200 body starts at byte 0,
-// so the single connection skips the prefix already stored.
-func discardPrefix(ctx context.Context, body io.Reader, n int64) error {
+// so the single connection skips the prefix already stored. Reads go
+// through idle, so a stall here is retried as in the transfer itself.
+func discardPrefix(ctx context.Context, idle *idleCloser, body io.Reader, n int64) error {
 	buf := make([]byte, 64*1024)
 	var dropped int64
 	for dropped < n {
@@ -967,7 +975,10 @@ func discardPrefix(ctx context.Context, body io.Reader, n int64) error {
 		if want > int64(len(buf)) {
 			want = int64(len(buf))
 		}
-		nr, err := body.Read(buf[:want])
+		nr, err := idle.read(body, buf[:want])
+		if err != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		dropped += int64(nr)
 		if err != nil {
 			if errors.Is(err, io.EOF) && dropped >= n {
@@ -1006,6 +1017,11 @@ func (d *Download) noteIgnoredRange() {
 func (d *Download) planAlone() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.planAloneLocked()
+}
+
+// planAloneLocked is planAlone for a caller that holds d.mu.
+func (d *Download) planAloneLocked() {
 	if d.Total <= 0 {
 		return
 	}

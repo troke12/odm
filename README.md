@@ -221,8 +221,10 @@ the `ETag` and `Last-Modified` from the probe, so a restart continues from
 the exact byte while the file on the server is unchanged. If `If-Range` fails
 (a `200` with another validator), or a later probe reports a different
 validator or size, ODM deletes the partial file and downloads the new one. A
-`200` with the same validator is a server ignoring `Range`: it is kept when
-the range already covers the whole file. A weak `ETag` is never sent as
+`200` with the same validator (or any `200` when there is no validator) is a
+server ignoring `Range`: the bytes already stored are kept and the rest is
+fetched on one connection, skipping the stored prefix of that body. A resume
+probe that finds ranges gone does the same. A weak `ETag` is never sent as
 `If-Range`. Segmented ranges, byte-offset resume and chunk
 splitting are standard download-manager techniques. ODM implements them in
 its own code.
