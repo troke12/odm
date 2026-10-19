@@ -23,7 +23,8 @@ All notable changes to ODM are documented here. The format is based on
   same size starts over instead of being joined to the old one.
 - The size probe requests the first byte (`Range: bytes=0-0`). A server that
   answers 200 for a range covering the whole file is still segmented when
-  that one-byte request returns 206.
+  that one-byte request returns 206; a file it serves as one chunk (one
+  connection, or too small to split) takes that 200 as the whole file.
 
 ## [0.4.3] - 2026-10-19
 

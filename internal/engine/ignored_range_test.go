@@ -111,7 +111,7 @@ func TestIgnoredSubrangeKeepsFinishedBytes(t *testing.T) {
 		// The resume probe (bytes=0-) is answered like any request to a
 		// server that ignores Range: the whole file. A transfer asking from
 		// byte 0 would mean the stored prefix was thrown away.
-		if start == 0 && spec != "bytes=0-" {
+		if start == 0 && spec != probeRange {
 			http.Error(w, "restarted from byte 0", http.StatusInternalServerError)
 			return
 		}
@@ -182,7 +182,7 @@ func TestIgnoredSubrangeKeepsFinishedBytes(t *testing.T) {
 		t.Fatal("no range was requested")
 	}
 	for _, spec := range ranges {
-		if spec == "bytes=0-" {
+		if spec == probeRange {
 			continue // the resume probe
 		}
 		parts := strings.SplitN(strings.TrimPrefix(spec, "bytes="), "-", 2)
@@ -208,14 +208,12 @@ func TestSubrangeOKFallsBackToOneConnection(t *testing.T) {
 		mu.Lock()
 		ranges = append(ranges, spec)
 		mu.Unlock()
-		parts := strings.SplitN(strings.TrimPrefix(spec, "bytes="), "-", 2)
-		open := len(parts) == 2 && parts[1] == ""
-		if open {
+		if isProbe(r) {
 			w.Header().Set("Accept-Ranges", "bytes")
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)))
-			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.Header().Set("Content-Length", "1")
 			w.WriteHeader(http.StatusPartialContent)
-			_, _ = w.Write(data)
+			_, _ = w.Write(data[:1])
 			return
 		}
 		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
@@ -288,7 +286,7 @@ func TestDiscardPrefixStallRetries(t *testing.T) {
 	const half = 128 * 1024
 	var transfers atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Range") == "bytes=0-" {
+		if isProbe(r) {
 			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 			w.WriteHeader(http.StatusOK)
 			return // the resume probe only reads the headers

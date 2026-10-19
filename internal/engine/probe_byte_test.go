@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestProbeFirstByteStillSegments covers a server that answers 200 when the
@@ -57,14 +58,7 @@ func TestProbeFirstByteStillSegments(t *testing.T) {
 
 	dir := t.TempDir()
 	d := New("probe-byte", srv.URL+"/file.bin", dir, 4, nil, 0, srv.Client())
-	t.Cleanup(func() {
-		d.mu.Lock()
-		if d.file != nil {
-			_ = d.file.Close()
-			d.file = nil
-		}
-		d.mu.Unlock()
-	})
+	t.Cleanup(func() { closeEngineFile(d) })
 	d.Start(context.Background())
 
 	info := d.Info()
@@ -106,4 +100,64 @@ func testWholeSpan(h string, total int) (start, end int, whole bool) {
 	}
 	end, _ = strconv.Atoi(parts[1])
 	return start, end, start == 0 && end >= total-1
+}
+
+// A server that answers 206 to the one-byte probe but 200 to a range that
+// covers the whole file. With a single chunk (one connection, or a file too
+// small to split) the transfer asks for exactly that range: the whole-file
+// 200 must be kept, as it was when the probe asked for "bytes=0-" and saw
+// the 200 itself.
+func TestProbeFirstByteSingleChunk(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		size  int
+		conns int
+	}{
+		{"one connection", 256 * 1024, 1},
+		{"small file", 100 * 1024, 4}, // under 2*MinChunkSize: one chunk
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			data := bytes.Repeat([]byte("s"), c.size)
+			var fullOK atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Range") == "bytes=0-0" {
+					w.Header().Set("Accept-Ranges", "bytes")
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+					w.Header().Set("Content-Length", "1")
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = w.Write(data[:1])
+					return
+				}
+				if _, _, whole := testWholeSpan(r.Header.Get("Range"), len(data)); !whole {
+					t.Errorf("unexpected range %q", r.Header.Get("Range"))
+				}
+				fullOK.Add(1)
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+			}))
+			defer srv.Close()
+
+			dir := t.TempDir()
+			d := New("single", srv.URL+"/s.bin", dir, c.conns, nil, 0, srv.Client())
+			d.retryBase = time.Millisecond
+			t.Cleanup(func() { closeEngineFile(d) })
+			d.Start(context.Background())
+
+			info := d.Info()
+			if info.Status != StatusComplete {
+				t.Fatalf("status=%s err=%q", info.Status, info.Error)
+			}
+			if n := fullOK.Load(); n != 1 {
+				t.Fatalf("whole-file responses = %d, want 1", n)
+			}
+			got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatal("downloaded bytes do not match the source")
+			}
+		})
+	}
 }

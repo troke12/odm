@@ -140,7 +140,7 @@ func TestStalledConnectionRetriesFromLastByte(t *testing.T) {
 		parts := strings.SplitN(spec, "-", 2)
 		start, _ := strconv.Atoi(parts[0])
 		end := len(data) - 1
-		explicit := len(parts) == 2 && parts[1] != ""
+		explicit := len(parts) == 2 && parts[1] != "" && !isProbe(r)
 		if explicit {
 			if v, err := strconv.Atoi(parts[1]); err == nil {
 				end = v
@@ -321,13 +321,20 @@ func TestSlowHeadersWithinHeaderLimit(t *testing.T) {
 	}
 }
 
+// probeRange is what Inspect asks for. Test servers tell the probe from a
+// transfer by it: a transfer always names both ends of its range.
+const probeRange = "bytes=0-0"
+
+func isProbe(r *http.Request) bool { return r.Header.Get("Range") == probeRange }
+
+// testRange parses a request's Range. explicit is false for the probe and
+// for an open-ended range, true for a transfer.
 func testRange(r *http.Request, total int) (start, end int, explicit bool) {
 	spec := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
 	parts := strings.SplitN(spec, "-", 2)
 	start, _ = strconv.Atoi(parts[0])
 	end = total - 1
-	explicit = len(parts) == 2 && parts[1] != ""
-	if explicit {
+	if len(parts) == 2 && parts[1] != "" {
 		if v, err := strconv.Atoi(parts[1]); err == nil {
 			end = v
 		}
@@ -335,7 +342,7 @@ func testRange(r *http.Request, total int) (start, end int, explicit bool) {
 	if end >= total {
 		end = total - 1
 	}
-	return start, end, explicit
+	return start, end, len(parts) == 2 && parts[1] != "" && !isProbe(r)
 }
 
 func writeTestRange(w http.ResponseWriter, data []byte, start, end int) {
