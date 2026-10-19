@@ -8,7 +8,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestSegmentTransportDisablesHTTP2(t *testing.T) {
@@ -46,6 +48,73 @@ func TestSegmentTransportDisablesHTTP2(t *testing.T) {
 	if segmentTransport(nil).TLSNextProto == nil {
 		t.Fatal("nil base left HTTP/2 on")
 	}
+	// Cloning set up HTTP/2 on base; the copy must not offer it in ALPN.
+	if p := h1.TLSClientConfig.NextProtos; len(p) != 1 || p[0] != "http/1.1" {
+		t.Fatalf("segment transport ALPN = %v, want [http/1.1]", p)
+	}
+	if p := segmentTransport(nil).TLSClientConfig.NextProtos; len(p) != 1 || p[0] != "http/1.1" {
+		t.Fatalf("nil base ALPN = %v, want [http/1.1]", p)
+	}
+}
+
+// Over TLS with a server that speaks HTTP/2 (most CDNs), the segmented
+// connections must negotiate HTTP/1.1 and each get a socket. Plain-HTTP
+// tests never reach ALPN, which is where offering h2 broke every chunk.
+func TestSegmentedDownloadOverHTTP2Server(t *testing.T) {
+	data := make([]byte, 512*1024)
+	for i := range data {
+		data[i] = byte(i * 13)
+	}
+	var mu sync.Mutex
+	protos := map[string]int{}
+	conns := map[string]bool{}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		protos[r.Proto]++
+		if r.Header.Get("Range") != probeRange {
+			conns[r.RemoteAddr] = true
+		}
+		mu.Unlock()
+		http.ServeContent(w, r, "f.bin", time.Time{}, bytes.NewReader(data))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	client := srv.Client()
+	if tr, ok := client.Transport.(*http.Transport); !ok || !tr.ForceAttemptHTTP2 {
+		t.Fatal("test client is not set up for HTTP/2")
+	}
+	dir := t.TempDir()
+	d := New("h2", srv.URL+"/f.bin", dir, 4, nil, 0, client)
+	d.retryBase = time.Millisecond
+	t.Cleanup(func() { closeEngineFile(d) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	d.Start(ctx)
+
+	info := d.Info()
+	if info.Status != StatusComplete {
+		t.Fatalf("status=%s err=%q protos=%v", info.Status, info.Error, protos)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, info.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded bytes do not match")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if protos["HTTP/2.0"] < 1 {
+		t.Fatalf("the probe did not use HTTP/2 (protos=%v); the test server is not speaking it", protos)
+	}
+	if protos["HTTP/1.1"] < 2 {
+		t.Fatalf("segmented requests did not use HTTP/1.1: %v", protos)
+	}
+	if len(conns) < 2 {
+		t.Fatalf("segmented requests shared %d socket(s)", len(conns))
+	}
 }
 
 func TestSegmentedDownloadUsesHTTP1(t *testing.T) {
@@ -74,7 +143,12 @@ func TestSegmentedDownloadUsesHTTP1(t *testing.T) {
 	if d.h1 == nil {
 		t.Fatal("several connections did not get an HTTP/1.1 client")
 	}
-	tr, ok := d.h1.Transport.(*http.Transport)
+	// The HTTP/1.1 client goes through the local-network guard too.
+	g, ok := d.h1.Transport.(*localGuard)
+	if !ok {
+		t.Fatalf("segment client transport is %T, not the local-network guard", d.h1.Transport)
+	}
+	tr, ok := g.next.(*http.Transport)
 	if !ok || tr.ForceAttemptHTTP2 || tr.TLSNextProto == nil {
 		t.Fatal("segment client can still negotiate HTTP/2")
 	}

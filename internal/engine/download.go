@@ -223,9 +223,15 @@ func (d *Download) Start(parent context.Context) {
 		// file that is still open.
 		f := d.file
 		d.file = nil
+		h1 := d.h1
 		d.mu.Unlock()
 		if f != nil {
 			_ = f.Close()
+		}
+		// The HTTP/1.1 client's pool belongs to this download alone: its
+		// idle sockets would otherwise stay open after the run.
+		if h1 != nil {
+			h1.CloseIdleConnections()
 		}
 	}()
 	d.mu.Lock()

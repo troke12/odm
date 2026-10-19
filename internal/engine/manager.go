@@ -135,6 +135,17 @@ func segmentTransport(base *http.Transport) *http.Transport {
 	t.ForceAttemptHTTP2 = false
 	// A non-nil empty map turns off automatic HTTP/2.
 	t.TLSNextProto = map[string]func(authority string, c *tls.Conn) http.RoundTripper{}
+	// Clone first configures HTTP/2 on base, which puts "h2" in its TLS
+	// config's ALPN list, and the copy keeps it. Offered h2, a server picks
+	// it, and this transport (with no h2 in TLSNextProto) would then speak
+	// HTTP/1.1 on an HTTP/2 connection: every request fails. Offer only
+	// http/1.1.
+	if t.TLSClientConfig == nil {
+		t.TLSClientConfig = &tls.Config{}
+	} else {
+		t.TLSClientConfig = t.TLSClientConfig.Clone()
+	}
+	t.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	return t
 }
 
